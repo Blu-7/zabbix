@@ -1,0 +1,197 @@
+###############################################################################
+# Zabbix Monitoring Stack - Docker Compose (Revised)
+# Ref: https://www.zabbix.com/documentation/7.0/en/manual/installation/containers
+# Ref: https://github.com/zabbix/zabbix-docker
+###############################################################################
+
+x-common-env: &common-env
+  DB_SERVER_HOST: ${DB_SERVER_HOST:-postgres}
+  POSTGRES_DB: ${POSTGRES_DB:-zabbix}
+  POSTGRES_USER: ${POSTGRES_USER:-zabbix}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-zabbix_secret}
+  ZBX_SERVER_HOST: ${ZBX_SERVER_HOST:-zabbix-server}
+
+services:
+  # ===========================================================================
+  # PostgreSQL 16
+  # ===========================================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: zabbix-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-zabbix}
+      POSTGRES_USER: ${POSTGRES_USER:-zabbix}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-zabbix_secret}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./config/postgres/init-scripts:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    networks:
+      - zabbix-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-zabbix} -d ${POSTGRES_DB:-zabbix}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+  # ===========================================================================
+  # Zabbix Server 7.0 LTS
+  # ===========================================================================
+  zabbix-server:
+    image: zabbix/zabbix-server-pgsql:7.0-alpine-latest
+    container_name: zabbix-server
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      ZBX_STARTPOLLERS: ${ZBX_STARTPOLLERS:-10}
+      ZBX_STARTHTTPPOLLERS: ${ZBX_STARTHTTPPOLLERS:-5}
+      ZBX_STARTPINGERS: ${ZBX_STARTPINGERS:-5}
+      ZBX_CACHESIZE: ${ZBX_CACHESIZE:-128M}
+      ZBX_HISTORYCACHESIZE: ${ZBX_HISTORYCACHESIZE:-64M}
+      ZBX_TIMEOUT: ${ZBX_TIMEOUT:-30}
+    volumes:
+      - zabbix_server_data:/var/lib/zabbix
+      - ./alertscripts:/usr/lib/zabbix/alertscripts:ro
+    ports:
+      - "${ZBX_SERVER_PORT:-10051}:10051"
+    networks:
+      - zabbix-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "zabbix_server", "-R", "diaginfo=historycache"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '1.0'
+          memory: 1G
+
+  # ===========================================================================
+  # Zabbix Web Frontend (Nginx)
+  # - Dashboard, configuration UI
+  # - Zabbix API endpoint (JSON-RPC) cho tenant-discovery service
+  # ===========================================================================
+  zabbix-web:
+    image: zabbix/zabbix-web-nginx-pgsql:7.0-alpine-latest
+    container_name: zabbix-web
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      ZBX_SERVER_NAME: "Tenant Monitoring"
+      PHP_TZ: ${PHP_TZ:-Asia/Ho_Chi_Minh}
+    ports:
+      - "${ZBX_WEB_PORT:-8080}:8080"
+      - "${ZBX_WEB_SSL_PORT:-8443}:8443"
+    networks:
+      - zabbix-net
+    depends_on:
+      zabbix-server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+
+  # ===========================================================================
+  # Zabbix Agent 2
+  # Shares network with zabbix-server so the default "Zabbix server" host
+  # can reach the agent at 127.0.0.1:10050.
+  # ===========================================================================
+  zabbix-agent2:
+    image: zabbix/zabbix-agent2:7.0-alpine-latest
+    container_name: zabbix-agent2
+    restart: unless-stopped
+    network_mode: "service:zabbix-server"
+    environment:
+      ZBX_HOSTNAME: "Zabbix server"
+      ZBX_SERVER_HOST: 127.0.0.1
+    depends_on:
+      zabbix-server:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '0.25'
+          memory: 128M
+
+  # ===========================================================================
+  # Tenant Discovery Service (Python)
+  #
+  # VAI TRÒ DUY NHẤT:
+  #   1. Gọi https://quyettam.cloud/get-available-tenant để lấy tenant list
+  #   2. Sync danh sách vào Zabbix (tạo/cập nhật Host + Web Scenario)
+  #   3. Disable tenant không còn active
+  #
+  # KHÔNG LÀM:
+  #   ✗ Không gửi HTTP check tới tenant (Zabbix Server làm)
+  #   ✗ Không gửi alert trực tiếp (Zabbix Server gọi alertscripts)
+  #   ✗ Không ghi uptime data (Zabbix Server ghi vào history tables)
+  # ===========================================================================
+  tenant-discovery:
+    build:
+      context: ./scripts/tenant-discovery
+      dockerfile: Dockerfile
+    container_name: tenant-discovery
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      TENANT_API_URL: ${TENANT_API_URL_DOCKER:-http://host.docker.internal:8080/quyettamv2/webhooks/get_tenant.php}
+      TENANT_API_KEY: ${TENANT_API_KEY:-}
+      ZABBIX_API_URL: http://zabbix-web:8080/api_jsonrpc.php
+      ZABBIX_API_USER: ${ZABBIX_API_USER:-Admin}
+      ZABBIX_API_PASSWORD: ${ZABBIX_API_PASSWORD:-zabbix}
+      DISCOVERY_INTERVAL: ${DISCOVERY_INTERVAL:-300}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    networks:
+      - zabbix-net
+    depends_on:
+      zabbix-web:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '0.25'
+          memory: 128M
+        reservations:
+          cpus: '0.1'
+          memory: 64M
+
+networks:
+  zabbix-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+volumes:
+  postgres_data:
+    driver: local
+  zabbix_server_data:
+    driver: local
