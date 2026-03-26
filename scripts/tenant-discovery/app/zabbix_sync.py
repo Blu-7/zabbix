@@ -108,7 +108,7 @@ def _ensure_web_scenario(host_id: str, tenant: TenantInfo, update: bool) -> None
     _zapi.httptest.create(
         name=scenario_name,
         hostid=host_id,
-        delay="60s",
+        delay="120s",
         retries=2,
         status=0,
         steps=[{
@@ -116,7 +116,7 @@ def _ensure_web_scenario(host_id: str, tenant: TenantInfo, update: bool) -> None
             "url": tenant.health_endpoint,
             "status_codes": "200",
             "no": 1,
-            "timeout": "15s",
+            "timeout": "7s",
             "follow_redirects": 1,
         }],
     )
@@ -130,13 +130,16 @@ def _ensure_triggers(host_id: str, host_name: str, tenant: TenantInfo) -> None:
     down_desc = f"[{tenant.tenant_name}] SITE DOWN - {tenant.domain}"
     slow_desc = f"[{tenant.tenant_name}] Slow response - {tenant.domain}"
 
+    # Downtime expression: check if the site is down (status code 404, 500, 503)
     down_expr = (
         f"last(/{host_name}/web.test.rspcode[{scenario_name},{step_name}])=404"
         f" or last(/{host_name}/web.test.rspcode[{scenario_name},{step_name}])=500"
         f" or last(/{host_name}/web.test.rspcode[{scenario_name},{step_name}])=503"
     )
-    slow_expr = f"last(/{host_name}/web.test.time[{scenario_name},{step_name},resp])>5"
+    # Slow response expression: check if the response time is greater than 7 seconds
+    slow_expr = f"last(/{host_name}/web.test.time[{scenario_name},{step_name},resp])>7"
 
+    # Create downtime trigger if it doesn't exist
     existing_down = _zapi.trigger.get(
         hostids=host_id,
         filter={"description": down_desc},
@@ -157,6 +160,7 @@ def _ensure_triggers(host_id: str, host_name: str, tenant: TenantInfo) -> None:
             ],
         )
 
+    # Create slow response trigger if it doesn't exist
     existing_slow = _zapi.trigger.get(
         hostids=host_id,
         filter={"description": slow_desc},
