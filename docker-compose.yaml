@@ -162,7 +162,7 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
-      TENANT_API_URL: ${TENANT_API_URL_DOCKER:-http://host.docker.internal:8080/quyettamv2/webhooks/get_tenant.php}
+      TENANT_API_URL: ${TENANT_API_URL:-http://host.docker.internal:8080/quyettamv2/webhooks/get_tenant.php}
       TENANT_API_KEY: ${TENANT_API_KEY:-}
       ZABBIX_API_URL: http://zabbix-web:8080/api_jsonrpc.php
       ZABBIX_API_USER: ${ZABBIX_API_USER:-Admin}
