@@ -93,6 +93,7 @@ def sync_tenant(tenant: TenantInfo, group_id: str) -> str:
             _zapi.host.update(hostid=host_id, status=0)
             logger.info("Re-enabled host %s (tenant active again)", host_name)
         _ensure_host_tags(host_id, tenant)
+        _ensure_host_macros(host_id, tenant)
         _ensure_web_scenario(host_id, tenant, update=True, scenario_name=scenario_name, step_name=step_name)
         _ensure_health_response_item(host_id, tenant)
         _ensure_triggers(host_id, host_name, tenant, scenario_name=scenario_name, step_name=step_name)
@@ -112,6 +113,7 @@ def sync_tenant(tenant: TenantInfo, group_id: str) -> str:
     logger.info("Created host %s (id=%s)", host_name, host_id)
 
     _ensure_host_tags(host_id, tenant)
+    _ensure_host_macros(host_id, tenant)
     _ensure_web_scenario(host_id, tenant, update=False, scenario_name=scenario_name, step_name=step_name)
     _ensure_health_response_item(host_id, tenant)
     _ensure_triggers(host_id, host_name, tenant, scenario_name=scenario_name, step_name=step_name)
@@ -139,6 +141,24 @@ def _ensure_host_tags(host_id: str, tenant: TenantInfo) -> None:
 
     new_tags = [{"tag": k, "value": v} for k, v in tag_map.items()]
     _zapi.host.update(hostid=host_id, tags=new_tags)
+
+
+def _ensure_host_macros(host_id: str, tenant: TenantInfo) -> None:
+    """Host macro {$TENANT.DOMAIN} for alert message templates (e.g. SITE DOWN - <domain>)."""
+    macro_name = "{$TENANT.DOMAIN}"
+    hosts = _zapi.host.get(
+        hostids=host_id,
+        selectMacros=["hostmacroid", "macro", "value"],
+        output=["hostid"],
+    )
+    current = hosts[0].get("macros", []) if hosts else []
+    found = next((m for m in current if m.get("macro") == macro_name), None)
+    if found and found.get("value") == tenant.domain:
+        return
+    if found:
+        _zapi.usermacro.update(hostmacroid=found["hostmacroid"], value=tenant.domain)
+    else:
+        _zapi.usermacro.create(hostid=host_id, macro=macro_name, value=tenant.domain)
 
 
 def _ensure_web_scenario(
@@ -233,7 +253,7 @@ def _ensure_triggers(
         for c in codes
     )
     down_opdata = (
-        f"HTTP code: {{?last(/{host_name}/web.test.rspcode[{scenario_name},{step_name}])}}\n"
+        f"Status code: {{?last(/{host_name}/web.test.rspcode[{scenario_name},{step_name}])}}\n"
         f"Response: {{?last(/{host_name}/{config.ZABBIX_HEALTH_RESPONSE_ITEM_KEY})}}"
     )
     slow_expr = (
