@@ -31,13 +31,12 @@ def run_cycle():
     try:
         logger.info("--- Sync cycle start ---")
 
-        tenants = fetch_active_tenants()
-        if not tenants:
-            logger.warning("No tenants found, skipping")
-            return
-
         zabbix_sync.connect()
         group_id = zabbix_sync.ensure_host_group()
+
+        tenants = fetch_active_tenants()
+        if not tenants:
+            logger.warning("No tenants found from API, reconciling by disabling existing hosts in group")
 
         active_codes: set[str] = set()
         for tenant in tenants:

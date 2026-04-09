@@ -60,8 +60,9 @@ def fetch_active_tenants() -> list[TenantInfo]:
 
         seen_keys.add(key)
 
+        tenant_code = str(item["id"])
         tenants.append(TenantInfo(
-            tenant_code=item["id"],
+            tenant_code=tenant_code,
             tenant_name=domain,
             domain=domain,
             license_status=item["license_status"],
@@ -70,4 +71,5 @@ def fetch_active_tenants() -> list[TenantInfo]:
         ))
 
     logger.info("Fetched %d tenants from %s (after de-duplication)", len(tenants), config.TENANT_API_URL)
+    logger.debug("Active tenant codes from API: %s", [tenant.tenant_code for tenant in tenants])
     return tenants

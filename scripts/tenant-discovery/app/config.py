@@ -4,7 +4,7 @@ from dotenv import find_dotenv, load_dotenv
 
 load_dotenv(find_dotenv())
 
-TENANT_API_URL = os.getenv("TENANT_API_URL", "https://quyettam.cloud/get-tenant")
+TENANT_API_URL = os.getenv("TENANT_API_URL", "https://quyettam.cloud/get-tenant.php")
 TENANT_API_KEY = os.getenv("TENANT_API_KEY", "")
 TENANT_API_TIMEOUT = int(os.getenv("TENANT_API_TIMEOUT", "30"))
 

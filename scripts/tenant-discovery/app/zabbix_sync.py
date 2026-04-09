@@ -34,10 +34,14 @@ def ensure_host_group() -> str:
 def sync_tenant(tenant: TenantInfo, group_id: str) -> str:
     """Create or update Zabbix host + web scenario + triggers for a tenant."""
     host_name = f"tenant-{tenant.tenant_code}"
-    existing = _zapi.host.get(filter={"host": host_name})
+    existing = _zapi.host.get(filter={"host": host_name}, output=["hostid", "status"])
 
     if existing:
         host_id = existing[0]["hostid"]
+        # Host may have been disabled in a previous cycle; re-enable when tenant is active again.
+        if existing[0].get("status") == "1":
+            _zapi.host.update(hostid=host_id, status=0)
+            logger.info("Re-enabled host %s (tenant active again)", host_name)
         _ensure_host_tags(host_id, tenant)
         _ensure_web_scenario(host_id, tenant, update=True)
         _ensure_triggers(host_id, host_name, tenant)
@@ -187,8 +191,9 @@ def _ensure_triggers(host_id: str, host_name: str, tenant: TenantInfo) -> None:
 def disable_removed_tenants(active_codes: set[str], group_id: str) -> None:
     """Disable hosts whose tenant is no longer in the active list."""
     hosts = _zapi.host.get(groupids=group_id, output=["hostid", "host", "status"])
+    normalized_active_codes = {str(code) for code in active_codes}
     for host in hosts:
-        code = host["host"].replace("tenant-", "")
-        if code not in active_codes and host["status"] == "0":
+        code = str(host["host"]).replace("tenant-", "")
+        if code not in normalized_active_codes and host["status"] == "0":
             _zapi.host.update(hostid=host["hostid"], status=1)
             logger.warning("Disabled host %s (tenant removed)", host["host"])
