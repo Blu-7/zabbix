@@ -185,7 +185,7 @@ def _ensure_triggers(host_id: str, host_name: str, tenant: TenantInfo) -> None:
             ],
         )
 
-    logger.info("Ensured triggers for %s", tenant.tenant_code)
+    logger.info("Ensured triggers for %s", tenant.domain)
 
 
 def disable_removed_tenants(active_codes: set[str], group_id: str) -> None:

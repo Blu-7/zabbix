@@ -60,7 +60,7 @@ def fetch_active_tenants() -> list[TenantInfo]:
 
         seen_keys.add(key)
 
-        tenant_code = str(item["primary_site_url"])
+        tenant_code = str(item["id"])
         tenants.append(TenantInfo(
             tenant_code=tenant_code,
             tenant_name=domain,
