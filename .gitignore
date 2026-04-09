@@ -1,3 +1,4 @@
 .env
 .idea
 scripts/tenant-discovery/app/__pycache__
+docs
