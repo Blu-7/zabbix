@@ -35,7 +35,7 @@ def _http_item_monitor_fields(health_endpoint: str) -> dict[str, object]:
             "request_method": 1,
             "post_type": 2,
             "posts": _monitor_json_body(),
-            "headers": [],
+            "headers": [{"name": "Content-Type", "value": "application/json"}],
         }
     return {
         "request_method": 0,
@@ -326,7 +326,7 @@ def _ensure_health_response_item(host_id: str, tenant: TenantInfo) -> None:
         filter={"key_": item_key},
         output=[
             "itemid", "name", "url", "delay", "timeout",
-            "request_method", "post_type", "posts", "headers",
+            "request_method", "post_type", "posts", "headers", "retrieve_mode",
         ],
     )
 
@@ -341,6 +341,7 @@ def _ensure_health_response_item(host_id: str, tenant: TenantInfo) -> None:
         "delay": config.ZABBIX_HEALTH_RESPONSE_ITEM_DELAY,
         "history": "7d",
         "trends": "0",
+        "retrieve_mode": 0,  # response body
         "follow_redirects": config.ZABBIX_WEB_CHECK_FOLLOW_REDIRECTS,
         **monitor,
     }
@@ -356,6 +357,8 @@ def _ensure_health_response_item(host_id: str, tenant: TenantInfo) -> None:
             patch["timeout"] = config.ZABBIX_WEB_CHECK_TIMEOUT
         if current.get("delay") != config.ZABBIX_HEALTH_RESPONSE_ITEM_DELAY:
             patch["delay"] = config.ZABBIX_HEALTH_RESPONSE_ITEM_DELAY
+        if int(current.get("retrieve_mode", -1) or -1) != 0:
+            patch["retrieve_mode"] = 0
         if int(current.get("request_method", -1) or -1) != int(monitor["request_method"]):
             patch["request_method"] = monitor["request_method"]
         if int(current.get("post_type", -1) or -1) != int(monitor["post_type"]):
