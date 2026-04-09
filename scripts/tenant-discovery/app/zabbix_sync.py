@@ -248,14 +248,16 @@ def _ensure_triggers(
     codes = [c.strip() for c in config.ZABBIX_TRIGGER_DOWN_RSP_CODES.split(",") if c.strip()]
     if not codes:
         codes = ["500", "502", "503", "504"]
-    down_expr = " or ".join(
+    down_expr_core = " or ".join(
         f"last(/{host_name}/web.test.rspcode[{scenario_name},{step_name}])={c}"
         for c in codes
     )
-    down_opdata = (
-        f"Status code: {{?last(/{host_name}/web.test.rspcode[{scenario_name},{step_name}])}}\n"
-        f"Response: {{?last(/{host_name}/{config.ZABBIX_HEALTH_RESPONSE_ITEM_KEY})}}"
+    # Include response item in expression so {ITEM.LASTVALUE2} is available in opdata/message macros.
+    down_expr = (
+        f"({down_expr_core}) and "
+        f"strlen(last(/{host_name}/{config.ZABBIX_HEALTH_RESPONSE_ITEM_KEY}))>=0"
     )
+    down_opdata = "Status code: {ITEM.LASTVALUE1}\nResponse: {ITEM.LASTVALUE2}"
     slow_expr = (
         f"last(/{host_name}/web.test.time[{scenario_name},{step_name},resp])>"
         f"{config.ZABBIX_WEB_SLOW_SECONDS}"
