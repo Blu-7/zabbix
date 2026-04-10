@@ -68,11 +68,11 @@ def _probe_health_route_status(health_url: str) -> int | None:
 def _pick_health_endpoint(base: str, health_url: str, probe_status: int | None) -> str:
     if probe_status is None:
         logger.warning(
-            "Healthcheck probe gave no status for %s; defaulting to healthcheck URL %s",
-            base,
+            "Healthcheck probe gave no status for %s (timeout/connection error); falling back to site base %s",
             health_url,
+            base,
         )
-        return health_url
+        return base
     if probe_status == config.HEALTHCHECK_FALLBACK_HTTP_STATUS:
         logger.info(
             "Healthcheck returned HTTP %s for %s; falling back to site base %s",
@@ -81,13 +81,11 @@ def _pick_health_endpoint(base: str, health_url: str, probe_status: int | None) 
             base,
         )
         return base
-    if not (200 <= probe_status <= 299):
-        logger.info(
-            "Healthcheck probe %s returned HTTP %s; route reachable, monitoring %s",
-            health_url,
-            probe_status,
-            health_url,
-        )
+    logger.info(
+        "Healthcheck probe %s returned HTTP %s; route exists, monitoring healthcheck endpoint",
+        health_url,
+        probe_status,
+    )
     return health_url
 
 
@@ -128,5 +126,5 @@ def fetch_active_tenants() -> list[TenantInfo]:
         ))
 
     logger.info("Fetched %d tenants from %s (after de-duplication)", len(tenants), config.TENANT_API_URL)
-    logger.debug("Active tenant codes from API: %s", [tenant.tenant_code for tenant in tenants])
+    logger.debug("Active tenant domains from API: %s", [tenant.domain for tenant in tenants])
     return tenants

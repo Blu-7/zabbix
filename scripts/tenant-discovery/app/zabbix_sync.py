@@ -35,7 +35,7 @@ def _http_item_monitor_fields(health_endpoint: str) -> dict[str, object]:
             "request_method": 1,
             "post_type": 2,
             "posts": _monitor_json_body(),
-            "headers": [{"name": "Content-Type", "value": "application/json"}],
+            "headers": [],
         }
     return {
         "request_method": 0,
@@ -81,7 +81,7 @@ def ensure_host_group() -> str:
 
 def sync_tenant(tenant: TenantInfo, group_id: str) -> str:
     """Create or update Zabbix host + web scenario + triggers for a tenant."""
-    host_name = f"tenant-{tenant.tenant_code}"
+    host_name = tenant.domain
     scenario_name = config.ZABBIX_WEB_SCENARIO_NAME_TEMPLATE.format(domain=tenant.domain)
     step_name = config.ZABBIX_WEB_STEP_NAME_TEMPLATE.format(domain=tenant.domain)
     existing = _zapi.host.get(filter={"host": host_name}, output=["hostid", "status"])
@@ -199,7 +199,7 @@ def _ensure_web_scenario(
                 payload["steps"] = [step_patch]
             if len(payload) > 1:
                 _zapi.httptest.update(**payload)
-                logger.info("Updated web scenario for %s", tenant.tenant_code)
+                logger.info("Updated web scenario for %s", tenant.domain)
             extra_ids = [
                 s["httptestid"] for s in scenarios if s["httptestid"] != chosen["httptestid"]
             ]
@@ -230,7 +230,7 @@ def _ensure_web_scenario(
         status=0,
         steps=[step_create],
     )
-    logger.info("Created web scenario for %s -> %s", tenant.tenant_code, tenant.health_endpoint)
+    logger.info("Created web scenario for %s -> %s", tenant.domain, tenant.health_endpoint)
 
 
 def _ensure_triggers(
@@ -248,16 +248,14 @@ def _ensure_triggers(
     codes = [c.strip() for c in config.ZABBIX_TRIGGER_DOWN_RSP_CODES.split(",") if c.strip()]
     if not codes:
         codes = ["500", "502", "503", "504"]
-    down_expr_core = " or ".join(
+    down_expr = " or ".join(
         f"last(/{host_name}/web.test.rspcode[{scenario_name},{step_name}])={c}"
         for c in codes
     )
-    # Include response item in expression so {ITEM.LASTVALUE2} is available in opdata/message macros.
-    down_expr = (
-        f"({down_expr_core}) and "
-        f"strlen(last(/{host_name}/{config.ZABBIX_HEALTH_RESPONSE_ITEM_KEY}))>=0"
+    down_opdata = (
+        f"Status code: {{?last(/{host_name}/web.test.rspcode[{scenario_name},{step_name}])}}\n"
+        f"Response: {{?last(/{host_name}/{config.ZABBIX_HEALTH_RESPONSE_ITEM_KEY})}}"
     )
-    down_opdata = "Status code: {ITEM.LASTVALUE1}\nResponse: {ITEM.LASTVALUE2}"
     slow_expr = (
         f"last(/{host_name}/web.test.time[{scenario_name},{step_name},resp])>"
         f"{config.ZABBIX_WEB_SLOW_SECONDS}"
@@ -315,7 +313,12 @@ def _ensure_triggers(
 
 
 def _ensure_health_response_item(host_id: str, tenant: TenantInfo) -> None:
-    """Create or update an HTTP agent item to expose raw healthcheck response in alerts."""
+    """Create or update an HTTP agent item that stores the raw healthcheck response body.
+
+    retrieve_mode=2 captures both response body and headers so alert messages
+    can include full context. The item delay is kept in sync with the web scenario
+    so last() in trigger opdata always reflects a fresh value.
+    """
     item_key = config.ZABBIX_HEALTH_RESPONSE_ITEM_KEY
     item_name = config.ZABBIX_HEALTH_RESPONSE_ITEM_NAME
 
@@ -341,8 +344,9 @@ def _ensure_health_response_item(host_id: str, tenant: TenantInfo) -> None:
         "delay": config.ZABBIX_HEALTH_RESPONSE_ITEM_DELAY,
         "history": "7d",
         "trends": "0",
-        "retrieve_mode": 0,  # response body
         "follow_redirects": config.ZABBIX_WEB_CHECK_FOLLOW_REDIRECTS,
+        "retrieve_mode": 2,  # body + headers
+        "allow_traps": 0,
         **monitor,
     }
 
@@ -357,8 +361,8 @@ def _ensure_health_response_item(host_id: str, tenant: TenantInfo) -> None:
             patch["timeout"] = config.ZABBIX_WEB_CHECK_TIMEOUT
         if current.get("delay") != config.ZABBIX_HEALTH_RESPONSE_ITEM_DELAY:
             patch["delay"] = config.ZABBIX_HEALTH_RESPONSE_ITEM_DELAY
-        if int(current.get("retrieve_mode", -1) or -1) != 0:
-            patch["retrieve_mode"] = 0
+        if int(current.get("retrieve_mode", -1) or -1) != 2:
+            patch["retrieve_mode"] = 2
         if int(current.get("request_method", -1) or -1) != int(monitor["request_method"]):
             patch["request_method"] = monitor["request_method"]
         if int(current.get("post_type", -1) or -1) != int(monitor["post_type"]):
@@ -370,16 +374,59 @@ def _ensure_health_response_item(host_id: str, tenant: TenantInfo) -> None:
             patch["headers"] = monitor["headers"]
         if len(patch) > 1:
             _zapi.item.update(**patch)
+            logger.info("Updated health response item for %s", tenant.domain)
     else:
         _zapi.item.create(**payload)
+        logger.info("Created health response item for %s -> %s", tenant.domain, tenant.health_endpoint)
 
 
-def disable_removed_tenants(active_codes: set[str], group_id: str) -> None:
-    """Disable hosts whose tenant is no longer in the active list."""
-    hosts = _zapi.host.get(groupids=group_id, output=["hostid", "host", "status"])
-    normalized_active_codes = {str(code) for code in active_codes}
+def migrate_legacy_hosts(group_id: str) -> None:
+    """One-time migration: rename hosts still using the old 'tenant-<uuid>' scheme to domain.
+
+    Looks up the {$TENANT.DOMAIN} macro on each old-style host and renames the
+    technical host name (host field) to the domain value. Safe to call every
+    cycle — hosts already using a domain name are ignored.
+    """
+    hosts = _zapi.host.get(
+        groupids=group_id,
+        output=["hostid", "host"],
+        selectMacros=["hostmacroid", "macro", "value"],
+    )
     for host in hosts:
-        code = str(host["host"]).replace("tenant-", "")
-        if code not in normalized_active_codes and host["status"] == "0":
+        name: str = host["host"]
+        # Old pattern: "tenant-" followed by a UUID (36 chars) or any non-domain string
+        if not name.startswith("tenant-"):
+            continue
+        macros: list[dict] = host.get("macros", [])
+        domain = next(
+            (m["value"] for m in macros if m.get("macro") == "{$TENANT.DOMAIN}"),
+            None,
+        )
+        if not domain:
+            logger.warning(
+                "Legacy host %s has no {$TENANT.DOMAIN} macro; skipping migration",
+                name,
+            )
+            continue
+        # Check no host with the target domain name already exists
+        conflict = _zapi.host.get(filter={"host": domain}, output=["hostid"])
+        if conflict:
+            logger.warning(
+                "Cannot rename %s -> %s: target host already exists (hostid=%s)",
+                name,
+                domain,
+                conflict[0]["hostid"],
+            )
+            continue
+        _zapi.host.update(hostid=host["hostid"], host=domain)
+        logger.info("Migrated host %s -> %s", name, domain)
+
+
+def disable_removed_tenants(active_domains: set[str], group_id: str) -> None:
+    """Disable hosts whose domain is no longer in the active list."""
+    hosts = _zapi.host.get(groupids=group_id, output=["hostid", "host", "status"])
+    normalized_active = {str(d) for d in active_domains}
+    for host in hosts:
+        if host["host"] not in normalized_active and host["status"] == "0":
             _zapi.host.update(hostid=host["hostid"], status=1)
             logger.warning("Disabled host %s (tenant removed)", host["host"])

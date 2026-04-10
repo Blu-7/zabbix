@@ -34,18 +34,20 @@ def run_cycle():
         zabbix_sync.connect()
         group_id = zabbix_sync.ensure_host_group()
 
+        zabbix_sync.migrate_legacy_hosts(group_id)
+
         tenants = fetch_active_tenants()
         if not tenants:
             logger.warning("No tenants found from API, reconciling by disabling existing hosts in group")
 
-        active_codes: set[str] = set()
+        active_domains: set[str] = set()
         for tenant in tenants:
             zabbix_sync.sync_tenant(tenant, group_id)
-            active_codes.add(tenant.tenant_code)
+            active_domains.add(tenant.domain)
 
-        zabbix_sync.disable_removed_tenants(active_codes, group_id)
+        zabbix_sync.disable_removed_tenants(active_domains, group_id)
 
-        logger.info("--- Sync cycle done (%d tenants) ---", len(active_codes))
+        logger.info("--- Sync cycle done (%d tenants) ---", len(active_domains))
         Path("/tmp/healthcheck").touch()
 
     except Exception:
