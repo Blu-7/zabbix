@@ -116,9 +116,10 @@ def fetch_active_tenants() -> list[TenantInfo]:
 
         seen_keys.add(key)
         tenant_code = str(item["id"])
+        tenant_name = str(item.get("name") or item.get("tenant_name") or domain)
         tenants.append(TenantInfo(
             tenant_code=tenant_code,
-            tenant_name=domain,
+            tenant_name=tenant_name,
             domain=domain,
             license_status=item["license_status"],
             expired_date=item["expired_date"],

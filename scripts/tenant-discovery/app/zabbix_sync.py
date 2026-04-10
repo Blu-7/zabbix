@@ -1,7 +1,7 @@
 import json
 import logging
 
-from pyzabbix import ZabbixAPI
+from pyzabbix import ZabbixAPI, ZabbixAPIException
 
 from . import config
 from .tenant_discovery import TenantInfo
@@ -79,7 +79,7 @@ def ensure_host_group() -> str:
     return gid
 
 
-def sync_tenant(tenant: TenantInfo, group_id: str) -> str:
+def sync_tenant(tenant: TenantInfo, group_id: str) -> str | None:
     """Create or update Zabbix host + web scenario + triggers for a tenant."""
     host_name = tenant.domain
     scenario_name = config.ZABBIX_WEB_SCENARIO_NAME_TEMPLATE.format(domain=tenant.domain)
@@ -99,16 +99,23 @@ def sync_tenant(tenant: TenantInfo, group_id: str) -> str:
         _ensure_triggers(host_id, host_name, tenant, scenario_name=scenario_name, step_name=step_name)
         return host_id
 
-    result = _zapi.host.create(
-        host=host_name,
-        name=f"{tenant.tenant_name} ({tenant.domain})",
-        groups=[{"groupid": group_id}],
-        tags=[
-            {"tag": "tenantId", "value": tenant.tenant_code},
-            {"tag": "licenseStatus", "value": tenant.license_status},
-            {"tag": "expiredDate", "value": tenant.expired_date},
-        ],
-    )
+    visible_name = tenant.tenant_name if tenant.tenant_name != tenant.domain else tenant.domain
+    try:
+        result = _zapi.host.create(
+            host=host_name,
+            name=visible_name,
+            groups=[{"groupid": group_id}],
+            tags=[
+                {"tag": "tenantId", "value": tenant.tenant_code},
+                {"tag": "licenseStatus", "value": tenant.license_status},
+                {"tag": "expiredDate", "value": tenant.expired_date},
+            ],
+        )
+    except ZabbixAPIException as exc:
+        if "same visible name" in str(exc) or "same technical name" in str(exc):
+            logger.warning("Skipping host create for %s: %s", host_name, exc)
+            return None
+        raise
     host_id = result["hostids"][0]
     logger.info("Created host %s (id=%s)", host_name, host_id)
 
@@ -403,8 +410,9 @@ def migrate_legacy_hosts(group_id: str) -> None:
             None,
         )
         if not domain:
-            logger.warning(
-                "Legacy host %s has no {$TENANT.DOMAIN} macro; skipping migration",
+            logger.info(
+                "Legacy host %s has no {$TENANT.DOMAIN} macro; "
+                "will be disabled by disable_removed_tenants after domain-named host is synced",
                 name,
             )
             continue
