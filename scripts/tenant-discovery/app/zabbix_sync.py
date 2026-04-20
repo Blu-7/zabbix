@@ -126,13 +126,24 @@ def _ensure_web_scenario(host_id: str, tenant: TenantInfo, *, scenario_name: str
     )
 
     if scenarios:
+        # Keep only the scenario matching our managed name; delete everything else (including
+        # legacy "Healthcheck response body" scenarios that made duplicate HTTP requests).
         chosen = next((s for s in scenarios if s.get("name") == scenario_name), None) or scenarios[0]
-        step = chosen["steps"][0]
 
+        extra_ids = [s["httptestid"] for s in scenarios if s["httptestid"] != chosen["httptestid"]]
+        if extra_ids:
+            _zapi.httptest.delete(*extra_ids)
+            logger.info(
+                "Deleted %d extra web scenario(s) for hostid=%s: %s",
+                len(extra_ids),
+                host_id,
+                [s["name"] for s in scenarios if s["httptestid"] != chosen["httptestid"]],
+            )
+
+        step = chosen["steps"][0]
         payload: dict[str, object] = {"httptestid": chosen["httptestid"]}
         if chosen.get("name") != scenario_name:
             payload["name"] = scenario_name
-
         step_patch: dict[str, object] = {"httpstepid": step["httpstepid"]}
         if step.get("url") != tenant.health_endpoint:
             step_patch["url"] = tenant.health_endpoint
@@ -147,11 +158,6 @@ def _ensure_web_scenario(host_id: str, tenant: TenantInfo, *, scenario_name: str
         if len(payload) > 1:
             _zapi.httptest.update(**payload)
             logger.info("Updated web scenario for %s", tenant.domain)
-
-        extra_ids = [s["httptestid"] for s in scenarios if s["httptestid"] != chosen["httptestid"]]
-        if extra_ids:
-            _zapi.httptest.delete(*extra_ids)
-            logger.warning("Removed %d duplicate web scenario(s) for hostid=%s", len(extra_ids), host_id)
         return
 
     _zapi.httptest.create(
@@ -175,10 +181,10 @@ def _ensure_web_scenario(host_id: str, tenant: TenantInfo, *, scenario_name: str
 
 
 def _ensure_health_response_item(host_id: str, tenant: TenantInfo, scenario_name: str, step_name: str) -> None:
-    """Dependent Item that mirrors the web scenario response body (no extra HTTP request).
+    """Dependent Item (type=18) that reads the web scenario response body — no extra HTTP request.
 
-    Used in Telegram alert templates via:
-        {?last(/{HOST.HOST}/healthcheck.response.raw)}
+    Zabbix feeds the value from web.test.body[scenario,step] on each check cycle.
+    Reference in Telegram alert templates: {?last(/{HOST.HOST}/healthcheck.response.raw)}
     """
     item_key = config.ZABBIX_HEALTH_RESPONSE_ITEM_KEY
     item_name = config.ZABBIX_HEALTH_RESPONSE_ITEM_NAME
@@ -198,10 +204,11 @@ def _ensure_health_response_item(host_id: str, tenant: TenantInfo, scenario_name
 
     if existing:
         current = existing[0]
-        # Recreate if previously created as HTTP agent item (type=19)
         if int(current.get("type", -1) or -1) != 18:
+            # Legacy HTTP Agent item (type=19) or any other non-dependent type — delete and recreate.
             _zapi.item.delete(current["itemid"])
-            logger.info("Deleted legacy HTTP agent item for %s, recreating as Dependent", tenant.domain)
+            logger.info("Deleted legacy item (type=%s) for %s, recreating as Dependent", current.get("type"), tenant.domain)
+            existing = []
         else:
             patch: dict[str, object] = {"itemid": current["itemid"]}
             if current.get("name") != item_name:
@@ -294,16 +301,20 @@ def _ensure_triggers(
 
     logger.info("Ensured triggers for %s", tenant.domain)
 
-    # Remove unmanaged triggers (built-in web scenario triggers, legacy triggers, etc.)
-    # inherited=False skips template-inherited triggers which cannot be deleted via API.
-    all_triggers = _zapi.trigger.get(hostids=host_id, output=["triggerid", "description"], inherited=False)
+    # Remove all unmanaged triggers — includes Zabbix built-in "Last error message of scenario..."
+    # (flags=0 or flags=2/discovered) and legacy triggers from old code versions.
+    # Skip only flags=4 (template-inherited) which Zabbix API refuses to delete.
+    all_triggers = _zapi.trigger.get(hostids=host_id, output=["triggerid", "description", "flags"])
     for t in all_triggers:
-        if t.get("description") not in managed_descs:
-            try:
-                _zapi.trigger.delete(t["triggerid"])
-                logger.info("Removed unmanaged trigger '%s' (id=%s)", t["description"], t["triggerid"])
-            except ZabbixAPIException as exc:
-                logger.warning("Could not remove trigger '%s' (id=%s): %s", t["description"], t["triggerid"], exc)
+        if t.get("description") in managed_descs:
+            continue
+        if int(t.get("flags", 0) or 0) == 4:
+            continue
+        try:
+            _zapi.trigger.delete(t["triggerid"])
+            logger.info("Removed unmanaged trigger '%s' (id=%s, flags=%s)", t["description"], t["triggerid"], t.get("flags"))
+        except ZabbixAPIException as exc:
+            logger.warning("Could not remove trigger '%s' (id=%s): %s", t["description"], t["triggerid"], exc)
 
 
 def migrate_legacy_hosts(group_id: str) -> None:
