@@ -260,8 +260,8 @@ def _ensure_triggers(
         for c in codes
     )
     down_opdata = (
-        f"Status code: {{?last(/{host_name}/web.test.rspcode[{scenario_name},{step_name}])}}\n"
-        f"Response: {{?last(/{host_name}/{config.ZABBIX_HEALTH_RESPONSE_ITEM_KEY})}}"
+        f"Status code: {{ITEM.VALUE1}}\n"
+        f"Response time: {{?last(/{host_name}/web.test.time[{scenario_name},{step_name},resp])}}s"
     )
     slow_expr = (
         f"last(/{host_name}/web.test.time[{scenario_name},{step_name},resp])>"
@@ -317,6 +317,18 @@ def _ensure_triggers(
         )
 
     logger.info("Ensured triggers for %s", tenant.domain)
+    # Cleanup: remove Zabbix built-in web scenario error triggers
+    all_triggers = _zapi.trigger.get(
+        hostids=host_id,
+        output=["triggerid", "description", "expression"],
+    )
+    for t in all_triggers:
+        desc = t.get("description", "")
+        expr = t.get("expression", "")
+        # Remove triggers not managed by us (not match down_desc or slow_desc)
+        if desc != down_desc and desc != slow_desc:
+            _zapi.trigger.delete(t["triggerid"])
+            logger.info("Removed legacy trigger '%s' (id=%s)", desc, t["triggerid"])
 
 
 def _ensure_health_response_item(host_id: str, tenant: TenantInfo) -> None:
