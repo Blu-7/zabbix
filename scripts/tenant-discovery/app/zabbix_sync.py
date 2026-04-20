@@ -11,26 +11,6 @@ logger = logging.getLogger(__name__)
 _zapi: ZabbixAPI | None = None
 
 
-# ---------------------------------------------------------------------------
-# Preprocessing scripts (JavaScript, Zabbix preprocessing type=21)
-# ---------------------------------------------------------------------------
-
-# Master item captures headers + body (retrieve_mode=2). Response body is
-# everything after the first blank line that separates HTTP headers from body.
-_JS_EXTRACT_BODY = (
-    "var i = value.indexOf('\\r\\n\\r\\n');\n"
-    "if (i < 0) i = value.indexOf('\\n\\n');\n"
-    "if (i < 0) return value;\n"
-    "return value.substring(i).replace(/^\\r?\\n\\r?\\n/, '');"
-)
-
-# Status line is the first line of the response: "HTTP/1.1 200 OK".
-_JS_EXTRACT_STATUSCODE = (
-    "var m = /^HTTP\\/\\S+\\s+(\\d+)/.exec(value);\n"
-    "return m ? parseInt(m[1]) : 0;"
-)
-
-
 def _health_endpoint_uses_authenticated_healthcheck(health_endpoint: str) -> bool:
     """True when monitoring the real healthcheck path (POST+JSON); False for site-root fallback GET."""
     rel = config.HEALTHCHECK_REL_PATH.rstrip("/")
@@ -39,6 +19,14 @@ def _health_endpoint_uses_authenticated_healthcheck(health_endpoint: str) -> boo
 
 def _monitor_json_body() -> str:
     return json.dumps({"password": config.HEALTHCHECK_API_KEY})
+
+
+def _web_scenario_step_extras(health_endpoint: str) -> tuple[str, list[dict[str, str]]]:
+    if _health_endpoint_uses_authenticated_healthcheck(health_endpoint):
+        return _monitor_json_body(), [
+            {"name": "Content-Type", "value": "application/json"},
+        ]
+    return "", []
 
 
 def _http_item_monitor_fields(health_endpoint: str) -> dict[str, object]:
@@ -70,25 +58,6 @@ def _headers_match(a: object, b: object) -> bool:
     return _norm(a) == _norm(b)
 
 
-def _preprocessing_match(current: object, desired: list[dict[str, object]]) -> bool:
-    def _norm(obj: object) -> list[tuple[str, str, str, str]]:
-        if not isinstance(obj, list):
-            return []
-        rows: list[tuple[str, str, str, str]] = []
-        for step in obj:
-            if not isinstance(step, dict):
-                continue
-            rows.append((
-                str(step.get("type", "")),
-                str(step.get("params", "")),
-                str(step.get("error_handler", "0")),
-                str(step.get("error_handler_params", "")),
-            ))
-        return rows
-
-    return _norm(current) == _norm(desired)
-
-
 def connect() -> None:
     global _zapi
     if _zapi is not None:
@@ -111,12 +80,10 @@ def ensure_host_group() -> str:
 
 
 def sync_tenant(tenant: TenantInfo, group_id: str) -> str | None:
-    """Create or update Zabbix host + health items + triggers for a tenant.
-
-    Architecture: ONE upstream HTTP call per cycle via the master HTTP-agent
-    item; dependent items derive statuscode and response body via preprocessing.
-    """
+    """Create or update Zabbix host + web scenario + triggers for a tenant."""
     host_name = tenant.domain
+    scenario_name = config.ZABBIX_WEB_SCENARIO_NAME_TEMPLATE.format(domain=tenant.domain)
+    step_name = config.ZABBIX_WEB_STEP_NAME_TEMPLATE.format(domain=tenant.domain)
     existing = _zapi.host.get(filter={"host": host_name}, output=["hostid", "status"])
 
     if existing:
@@ -127,13 +94,9 @@ def sync_tenant(tenant: TenantInfo, group_id: str) -> str | None:
             logger.info("Re-enabled host %s (tenant active again)", host_name)
         _ensure_host_tags(host_id, tenant)
         _ensure_host_macros(host_id, tenant)
-        master_itemid = _ensure_health_master_item(host_id, tenant)
-        _ensure_health_statuscode_item(host_id, master_itemid, tenant)
-        _ensure_health_response_item(host_id, master_itemid, tenant)
-        _ensure_triggers(host_id, host_name, tenant)
-        # Legacy cleanup AFTER new structure is in place (avoids monitoring gap)
-        _cleanup_legacy_slow_trigger(host_id, tenant)
-        _cleanup_legacy_web_scenario(host_id, tenant)
+        _ensure_web_scenario(host_id, tenant, update=True, scenario_name=scenario_name, step_name=step_name)
+        _ensure_health_response_item(host_id, tenant)
+        _ensure_triggers(host_id, host_name, tenant, scenario_name=scenario_name, step_name=step_name)
         return host_id
 
     visible_name = tenant.tenant_name if tenant.tenant_name != tenant.domain else tenant.domain
@@ -158,10 +121,9 @@ def sync_tenant(tenant: TenantInfo, group_id: str) -> str | None:
 
     _ensure_host_tags(host_id, tenant)
     _ensure_host_macros(host_id, tenant)
-    master_itemid = _ensure_health_master_item(host_id, tenant)
-    _ensure_health_statuscode_item(host_id, master_itemid, tenant)
-    _ensure_health_response_item(host_id, master_itemid, tenant)
-    _ensure_triggers(host_id, host_name, tenant)
+    _ensure_web_scenario(host_id, tenant, update=False, scenario_name=scenario_name, step_name=step_name)
+    _ensure_health_response_item(host_id, tenant)
+    _ensure_triggers(host_id, host_name, tenant, scenario_name=scenario_name, step_name=step_name)
     return host_id
 
 
@@ -206,238 +168,107 @@ def _ensure_host_macros(host_id: str, tenant: TenantInfo) -> None:
         _zapi.usermacro.create(hostid=host_id, macro=macro_name, value=tenant.domain)
 
 
-def _ensure_health_master_item(host_id: str, tenant: TenantInfo) -> str:
-    """Single HTTP agent item that hits the healthcheck endpoint once per cycle.
+def _ensure_web_scenario(
+    host_id: str,
+    tenant: TenantInfo,
+    update: bool,
+    *,
+    scenario_name: str,
+    step_name: str,
+) -> None:
+    """Create or update a Web Scenario (Zabbix HTTP check)."""
+    desired_posts, desired_headers = _web_scenario_step_extras(tenant.health_endpoint)
 
-    - retrieve_mode=2 captures full response (status line + headers + body)
-      so dependent items can derive both the HTTP status code and the body
-      without issuing a second request.
-    - status_codes='100-599' accepts any HTTP response; the item never goes
-      UNSUPPORTED on 4xx/5xx, so we can still trigger on them.
-    - history='0' avoids persisting large raw dumps; dependent items keep
-      their own, smaller history.
+    if update:
+        scenarios = _zapi.httptest.get(
+            hostids=host_id,
+            selectSteps=["httpstepid", "url", "name", "posts", "headers"],
+            output=["httptestid", "name"],
+        )
+        if scenarios:
+            by_name = next((s for s in scenarios if s.get("name") == scenario_name), None)
+            chosen = by_name or scenarios[0]
+            step = chosen["steps"][0]
+            payload: dict[str, object] = {"httptestid": chosen["httptestid"]}
+            if chosen.get("name") != scenario_name:
+                payload["name"] = scenario_name
+            step_patch: dict[str, object] = {"httpstepid": step["httpstepid"]}
+            if step.get("url") != tenant.health_endpoint:
+                step_patch["url"] = tenant.health_endpoint
+            if step.get("name") != step_name:
+                step_patch["name"] = step_name
+            cur_posts = step.get("posts") if step.get("posts") is not None else ""
+            if cur_posts != desired_posts:
+                step_patch["posts"] = desired_posts
+            if not _headers_match(step.get("headers"), desired_headers):
+                step_patch["headers"] = desired_headers
+            if len(step_patch) > 1:
+                payload["steps"] = [step_patch]
+            if len(payload) > 1:
+                _zapi.httptest.update(**payload)
+                logger.info("Updated web scenario for %s", tenant.domain)
+            extra_ids = [
+                s["httptestid"] for s in scenarios if s["httptestid"] != chosen["httptestid"]
+            ]
+            if extra_ids:
+                _zapi.httptest.delete(*extra_ids)
+                logger.warning(
+                    "Removed %d duplicate web scenario(s) for hostid=%s",
+                    len(extra_ids),
+                    host_id,
+                )
+            return
 
-    Returns the itemid so dependents can link to it.
-    """
-    item_key = config.ZABBIX_HEALTH_MASTER_ITEM_KEY
-    item_name = config.ZABBIX_HEALTH_MASTER_ITEM_NAME
-
-    monitor = _http_item_monitor_fields(tenant.health_endpoint)
-
-    existing = _zapi.item.get(
-        hostids=host_id,
-        filter={"key_": item_key},
-        output=[
-            "itemid", "name", "url", "delay", "timeout", "request_method",
-            "post_type", "posts", "headers", "retrieve_mode", "status_codes",
-            "history", "trends", "follow_redirects",
-        ],
-    )
-
-    base_payload: dict[str, object] = {
-        "name": item_name,
-        "type": 19,  # HTTP agent
-        "key_": item_key,
-        "hostid": host_id,
-        "value_type": 4,  # text
+    step_create: dict[str, object] = {
+        "name": step_name,
         "url": tenant.health_endpoint,
+        "status_codes": config.ZABBIX_WEB_CHECK_STATUS_CODES,
+        "no": 1,
         "timeout": config.ZABBIX_WEB_CHECK_TIMEOUT,
-        "delay": config.ZABBIX_HEALTH_RESPONSE_ITEM_DELAY,
-        "history": "0",
-        "trends": "0",
         "follow_redirects": config.ZABBIX_WEB_CHECK_FOLLOW_REDIRECTS,
-        "retrieve_mode": 2,
-        "status_codes": "100-599",
-        "allow_traps": 0,
-        **monitor,
+        "posts": desired_posts,
+        "headers": desired_headers,
     }
-
-    if existing:
-        current = existing[0]
-        itemid = current["itemid"]
-        patch: dict[str, object] = {"itemid": itemid}
-        if current.get("name") != item_name:
-            patch["name"] = item_name
-        if current.get("url") != tenant.health_endpoint:
-            patch["url"] = tenant.health_endpoint
-        if current.get("timeout") != config.ZABBIX_WEB_CHECK_TIMEOUT:
-            patch["timeout"] = config.ZABBIX_WEB_CHECK_TIMEOUT
-        if current.get("delay") != config.ZABBIX_HEALTH_RESPONSE_ITEM_DELAY:
-            patch["delay"] = config.ZABBIX_HEALTH_RESPONSE_ITEM_DELAY
-        if int(current.get("retrieve_mode", -1) or -1) != 2:
-            patch["retrieve_mode"] = 2
-        if current.get("status_codes") != "100-599":
-            patch["status_codes"] = "100-599"
-        if str(current.get("history", "")) != "0":
-            patch["history"] = "0"
-        if str(current.get("trends", "")) != "0":
-            patch["trends"] = "0"
-        if int(current.get("follow_redirects", -1) or -1) != int(config.ZABBIX_WEB_CHECK_FOLLOW_REDIRECTS):
-            patch["follow_redirects"] = config.ZABBIX_WEB_CHECK_FOLLOW_REDIRECTS
-        if int(current.get("request_method", -1) or -1) != int(monitor["request_method"]):
-            patch["request_method"] = monitor["request_method"]
-        if int(current.get("post_type", -1) or -1) != int(monitor["post_type"]):
-            patch["post_type"] = monitor["post_type"]
-        cur_posts = current.get("posts") if current.get("posts") is not None else ""
-        if cur_posts != str(monitor["posts"]):
-            patch["posts"] = monitor["posts"]
-        if not _headers_match(current.get("headers"), monitor["headers"]):
-            patch["headers"] = monitor["headers"]
-        if len(patch) > 1:
-            _zapi.item.update(**patch)
-            logger.info("Updated health master item for %s", tenant.domain)
-        return itemid
-
-    result = _zapi.item.create(**base_payload)
-    itemid = result["itemids"][0]
-    logger.info("Created health master item for %s -> %s", tenant.domain, tenant.health_endpoint)
-    return itemid
-
-
-def _ensure_health_statuscode_item(host_id: str, master_itemid: str, tenant: TenantInfo) -> None:
-    """Dependent unsigned-int item: HTTP status code parsed from the master value."""
-    item_key = config.ZABBIX_HEALTH_STATUSCODE_ITEM_KEY
-    item_name = config.ZABBIX_HEALTH_STATUSCODE_ITEM_NAME
-
-    preprocessing = [{
-        "type": "21",  # JavaScript
-        "params": _JS_EXTRACT_STATUSCODE,
-        "error_handler": "0",
-        "error_handler_params": "",
-    }]
-
-    existing = _zapi.item.get(
-        hostids=host_id,
-        filter={"key_": item_key},
-        output=["itemid", "name", "type", "master_itemid", "value_type", "history", "trends"],
-        selectPreprocessing="extend",
+    _zapi.httptest.create(
+        name=scenario_name,
+        hostid=host_id,
+        delay=config.ZABBIX_WEB_CHECK_DELAY,
+        retries=config.ZABBIX_WEB_CHECK_RETRIES,
+        status=0,
+        steps=[step_create],
     )
-
-    if existing and str(existing[0].get("type", "")) != "18":
-        # Legacy standalone item using this key — delete so we can recreate as dependent.
-        _zapi.item.delete(existing[0]["itemid"])
-        logger.info("Deleted legacy standalone %s for %s (now dependent item)", item_key, tenant.domain)
-        existing = []
-
-    base_payload: dict[str, object] = {
-        "name": item_name,
-        "type": 18,  # Dependent item
-        "key_": item_key,
-        "hostid": host_id,
-        "value_type": 3,  # unsigned int
-        "master_itemid": master_itemid,
-        "history": "7d",
-        "trends": "0",
-        "preprocessing": preprocessing,
-    }
-
-    if existing:
-        current = existing[0]
-        patch: dict[str, object] = {"itemid": current["itemid"]}
-        if current.get("name") != item_name:
-            patch["name"] = item_name
-        if str(current.get("master_itemid", "")) != str(master_itemid):
-            patch["master_itemid"] = master_itemid
-        if int(current.get("value_type", -1) or -1) != 3:
-            patch["value_type"] = 3
-        if str(current.get("history", "")) != "7d":
-            patch["history"] = "7d"
-        if str(current.get("trends", "")) != "0":
-            patch["trends"] = "0"
-        if not _preprocessing_match(current.get("preprocessing", []), preprocessing):
-            patch["preprocessing"] = preprocessing
-        if len(patch) > 1:
-            _zapi.item.update(**patch)
-            logger.info("Updated health statuscode item for %s", tenant.domain)
-    else:
-        _zapi.item.create(**base_payload)
-        logger.info("Created health statuscode item for %s", tenant.domain)
+    logger.info("Created web scenario for %s -> %s", tenant.domain, tenant.health_endpoint)
 
 
-def _ensure_health_response_item(host_id: str, master_itemid: str, tenant: TenantInfo) -> None:
-    """Dependent text item: response body extracted from master (headers stripped)."""
-    item_key = config.ZABBIX_HEALTH_RESPONSE_ITEM_KEY
-    item_name = config.ZABBIX_HEALTH_RESPONSE_ITEM_NAME
-
-    preprocessing = [{
-        "type": "21",  # JavaScript
-        "params": _JS_EXTRACT_BODY,
-        "error_handler": "0",
-        "error_handler_params": "",
-    }]
-
-    existing = _zapi.item.get(
-        hostids=host_id,
-        filter={"key_": item_key},
-        output=["itemid", "name", "type", "master_itemid", "value_type", "history", "trends"],
-        selectPreprocessing="extend",
-    )
-
-    if existing and str(existing[0].get("type", "")) != "18":
-        # Legacy standalone HTTP agent item — delete so we can recreate as dependent.
-        _zapi.item.delete(existing[0]["itemid"])
-        logger.info("Deleted legacy standalone %s for %s (now dependent item)", item_key, tenant.domain)
-        existing = []
-
-    base_payload: dict[str, object] = {
-        "name": item_name,
-        "type": 18,  # Dependent item
-        "key_": item_key,
-        "hostid": host_id,
-        "value_type": 4,  # text
-        "master_itemid": master_itemid,
-        "history": "7d",
-        "trends": "0",
-        "preprocessing": preprocessing,
-    }
-
-    if existing:
-        current = existing[0]
-        patch: dict[str, object] = {"itemid": current["itemid"]}
-        if current.get("name") != item_name:
-            patch["name"] = item_name
-        if str(current.get("master_itemid", "")) != str(master_itemid):
-            patch["master_itemid"] = master_itemid
-        if int(current.get("value_type", -1) or -1) != 4:
-            patch["value_type"] = 4
-        if str(current.get("history", "")) != "7d":
-            patch["history"] = "7d"
-        if str(current.get("trends", "")) != "0":
-            patch["trends"] = "0"
-        if not _preprocessing_match(current.get("preprocessing", []), preprocessing):
-            patch["preprocessing"] = preprocessing
-        if len(patch) > 1:
-            _zapi.item.update(**patch)
-            logger.info("Updated health response item for %s", tenant.domain)
-    else:
-        _zapi.item.create(**base_payload)
-        logger.info("Created health response item for %s", tenant.domain)
-
-
-def _ensure_triggers(host_id: str, host_name: str, tenant: TenantInfo) -> None:
-    """Create or update the DOWN trigger using statuscode + response items."""
+def _ensure_triggers(
+    host_id: str,
+    host_name: str,
+    tenant: TenantInfo,
+    *,
+    scenario_name: str,
+    step_name: str,
+) -> None:
+    """Create or update DOWN + slow-response triggers for a tenant host."""
     down_desc = f"[{tenant.tenant_name}] SITE DOWN - {tenant.domain}"
+    slow_desc = f"[{tenant.tenant_name}] Slow response - {tenant.domain}"
 
     codes = [c.strip() for c in config.ZABBIX_TRIGGER_DOWN_RSP_CODES.split(",") if c.strip()]
     if not codes:
         codes = ["500", "502", "503", "504"]
-
-    statuscode_key = config.ZABBIX_HEALTH_STATUSCODE_ITEM_KEY
-    response_key = config.ZABBIX_HEALTH_RESPONSE_ITEM_KEY
-
-    rspcode_parts = [
-        f"last(/{host_name}/{statuscode_key})={c}"
+    down_expr = " or ".join(
+        f"last(/{host_name}/web.test.rspcode[{scenario_name},{step_name}])={c}"
         for c in codes
-    ]
-    # Reference the response item so {ITEM.VALUE2} resolves in opdata.
-    # length() is always >=0, so <0 is never true — clause never fires.
-    response_ref = f"length(last(/{host_name}/{response_key}))<0"
-    down_expr = " or ".join(rspcode_parts) + " or " + response_ref
+    )
     down_opdata = (
-        f"Status code: {{ITEM.VALUE1}}\n"
-        f"Response: {{ITEM.VALUE2}}"
+        f"Status code: {{?last(/{host_name}/web.test.rspcode[{scenario_name},{step_name}])}}\n"
+        f"Response: {{?last(/{host_name}/{config.ZABBIX_HEALTH_RESPONSE_ITEM_KEY})}}"
+    )
+    slow_expr = (
+        f"last(/{host_name}/web.test.time[{scenario_name},{step_name},resp])>"
+        f"{config.ZABBIX_WEB_SLOW_SECONDS}"
     )
 
+    # Create downtime trigger if it doesn't exist
     existing_down = _zapi.trigger.get(
         hostids=host_id,
         filter={"description": down_desc},
@@ -452,7 +283,6 @@ def _ensure_triggers(host_id: str, host_name: str, tenant: TenantInfo) -> None:
             payload["opdata"] = down_opdata
         if len(payload) > 1:
             _zapi.trigger.update(**payload)
-            logger.info("Updated down trigger for %s", tenant.domain)
     else:
         _zapi.trigger.create(
             description=down_desc,
@@ -464,41 +294,97 @@ def _ensure_triggers(host_id: str, host_name: str, tenant: TenantInfo) -> None:
                 {"tag": "tenant", "value": tenant.tenant_code},
             ],
         )
-        logger.info("Created down trigger for %s", tenant.domain)
+
+    # Create slow response trigger if it doesn't exist
+    existing_slow = _zapi.trigger.get(
+        hostids=host_id,
+        filter={"description": slow_desc},
+        output=["triggerid", "expression"],
+    )
+    if existing_slow:
+        trig = existing_slow[0]
+        if trig["expression"] != slow_expr:
+            _zapi.trigger.update(triggerid=trig["triggerid"], expression=slow_expr)
+    else:
+        _zapi.trigger.create(
+            description=slow_desc,
+            expression=slow_expr,
+            priority=2,
+            tags=[
+                {"tag": "scope", "value": "performance"},
+                {"tag": "tenant", "value": tenant.tenant_code},
+            ],
+        )
 
     logger.info("Ensured triggers for %s", tenant.domain)
 
 
-def _cleanup_legacy_web_scenario(host_id: str, tenant: TenantInfo) -> None:
-    """Remove legacy Web Scenario(s): replaced by the HTTP agent master item.
+def _ensure_health_response_item(host_id: str, tenant: TenantInfo) -> None:
+    """Create or update an HTTP agent item that stores the raw healthcheck response body.
 
-    Runs every sync cycle — it's a no-op when nothing left to clean.
+    retrieve_mode=2 captures both response body and headers so alert messages
+    can include full context. The item delay is kept in sync with the web scenario
+    so last() in trigger opdata always reflects a fresh value.
     """
-    scenarios = _zapi.httptest.get(hostids=host_id, output=["httptestid", "name"])
-    if not scenarios:
-        return
-    ids = [s["httptestid"] for s in scenarios]
-    _zapi.httptest.delete(*ids)
-    logger.info(
-        "Deleted %d legacy web scenario(s) for %s (double-hit eliminated)",
-        len(ids),
-        tenant.domain,
-    )
+    item_key = config.ZABBIX_HEALTH_RESPONSE_ITEM_KEY
+    item_name = config.ZABBIX_HEALTH_RESPONSE_ITEM_NAME
 
+    monitor = _http_item_monitor_fields(tenant.health_endpoint)
 
-def _cleanup_legacy_slow_trigger(host_id: str, tenant: TenantInfo) -> None:
-    """Remove legacy slow-response trigger — it referenced web.test.time which no longer exists."""
-    slow_desc = f"[{tenant.tenant_name}] Slow response - {tenant.domain}"
-    existing = _zapi.trigger.get(
+    existing = _zapi.item.get(
         hostids=host_id,
-        filter={"description": slow_desc},
-        output=["triggerid"],
+        filter={"key_": item_key},
+        output=[
+            "itemid", "name", "url", "delay", "timeout",
+            "request_method", "post_type", "posts", "headers", "retrieve_mode",
+        ],
     )
-    if not existing:
-        return
-    ids = [t["triggerid"] for t in existing]
-    _zapi.trigger.delete(*ids)
-    logger.info("Deleted legacy slow-response trigger for %s", tenant.domain)
+
+    payload: dict[str, object] = {
+        "name": item_name,
+        "type": 19,  # HTTP agent
+        "key_": item_key,
+        "hostid": host_id,
+        "value_type": 4,  # text
+        "url": tenant.health_endpoint,
+        "timeout": config.ZABBIX_WEB_CHECK_TIMEOUT,
+        "delay": config.ZABBIX_HEALTH_RESPONSE_ITEM_DELAY,
+        "history": "7d",
+        "trends": "0",
+        "follow_redirects": config.ZABBIX_WEB_CHECK_FOLLOW_REDIRECTS,
+        "retrieve_mode": 2,  # body + headers
+        "allow_traps": 0,
+        **monitor,
+    }
+
+    if existing:
+        current = existing[0]
+        patch: dict[str, object] = {"itemid": current["itemid"]}
+        if current.get("name") != item_name:
+            patch["name"] = item_name
+        if current.get("url") != tenant.health_endpoint:
+            patch["url"] = tenant.health_endpoint
+        if current.get("timeout") != config.ZABBIX_WEB_CHECK_TIMEOUT:
+            patch["timeout"] = config.ZABBIX_WEB_CHECK_TIMEOUT
+        if current.get("delay") != config.ZABBIX_HEALTH_RESPONSE_ITEM_DELAY:
+            patch["delay"] = config.ZABBIX_HEALTH_RESPONSE_ITEM_DELAY
+        if int(current.get("retrieve_mode", -1) or -1) != 2:
+            patch["retrieve_mode"] = 2
+        if int(current.get("request_method", -1) or -1) != int(monitor["request_method"]):
+            patch["request_method"] = monitor["request_method"]
+        if int(current.get("post_type", -1) or -1) != int(monitor["post_type"]):
+            patch["post_type"] = monitor["post_type"]
+        cur_posts = current.get("posts") if current.get("posts") is not None else ""
+        if cur_posts != str(monitor["posts"]):
+            patch["posts"] = monitor["posts"]
+        if not _headers_match(current.get("headers"), monitor["headers"]):
+            patch["headers"] = monitor["headers"]
+        if len(patch) > 1:
+            _zapi.item.update(**patch)
+            logger.info("Updated health response item for %s", tenant.domain)
+    else:
+        _zapi.item.create(**payload)
+        logger.info("Created health response item for %s -> %s", tenant.domain, tenant.health_endpoint)
 
 
 def migrate_legacy_hosts(group_id: str) -> None:
