@@ -11,21 +11,15 @@ logger = logging.getLogger(__name__)
 _zapi: ZabbixAPI | None = None
 
 
-def _health_endpoint_uses_authenticated_healthcheck(health_endpoint: str) -> bool:
-    """True when monitoring the real healthcheck path (POST+JSON); False for site-root fallback GET."""
+def _uses_authenticated_healthcheck(health_endpoint: str) -> bool:
     rel = config.HEALTHCHECK_REL_PATH.rstrip("/")
     return bool(rel) and health_endpoint.rstrip("/").endswith(rel)
 
 
-def _monitor_json_body() -> str:
-    return json.dumps({"password": config.HEALTHCHECK_API_KEY})
-
-
-def _web_scenario_step_extras(health_endpoint: str) -> tuple[str, list[dict[str, str]]]:
-    if _health_endpoint_uses_authenticated_healthcheck(health_endpoint):
-        return _monitor_json_body(), [
-            {"name": "Content-Type", "value": "application/json"},
-        ]
+def _step_extras(health_endpoint: str) -> tuple[str, list[dict[str, str]]]:
+    if _uses_authenticated_healthcheck(health_endpoint):
+        body = json.dumps({"password": config.HEALTHCHECK_API_KEY})
+        return body, [{"name": "Content-Type", "value": "application/json"}]
     return "", []
 
 
@@ -33,11 +27,7 @@ def _headers_match(a: object, b: object) -> bool:
     def _norm(obj: object) -> list[tuple[str, str]]:
         if not isinstance(obj, list) or not obj:
             return []
-        rows: list[tuple[str, str]] = []
-        for entry in obj:
-            if isinstance(entry, dict):
-                rows.append((str(entry.get("name", "")), str(entry.get("value", ""))))
-        return sorted(rows)
+        return sorted((str(e.get("name", "")), str(e.get("value", ""))) for e in obj if isinstance(e, dict))
 
     return _norm(a) == _norm(b)
 
@@ -52,11 +42,9 @@ def connect() -> None:
 
 
 def ensure_host_group() -> str:
-    """Create host group if it doesn't exist, return group ID."""
     groups = _zapi.hostgroup.get(filter={"name": [config.ZABBIX_HOST_GROUP]})
     if groups:
         return groups[0]["groupid"]
-
     result = _zapi.hostgroup.create(name=config.ZABBIX_HOST_GROUP)
     gid = result["groupids"][0]
     logger.info("Created host group '%s' (id=%s)", config.ZABBIX_HOST_GROUP, gid)
@@ -64,83 +52,61 @@ def ensure_host_group() -> str:
 
 
 def sync_tenant(tenant: TenantInfo, group_id: str) -> str | None:
-    """Create or update Zabbix host + web scenario + triggers for a tenant."""
     host_name = tenant.domain
     scenario_name = config.ZABBIX_WEB_SCENARIO_NAME_TEMPLATE.format(domain=tenant.domain)
     step_name = config.ZABBIX_WEB_STEP_NAME_TEMPLATE.format(domain=tenant.domain)
-    existing = _zapi.host.get(filter={"host": host_name}, output=["hostid", "status"])
 
+    existing = _zapi.host.get(filter={"host": host_name}, output=["hostid", "status"])
     if existing:
         host_id = existing[0]["hostid"]
-        # Host may have been disabled in a previous cycle; re-enable when tenant is active again.
         if existing[0].get("status") == "1":
             _zapi.host.update(hostid=host_id, status=0)
-            logger.info("Re-enabled host %s (tenant active again)", host_name)
-        _ensure_host_tags(host_id, tenant)
-        _ensure_host_macros(host_id, tenant)
-        _ensure_web_scenario(host_id, tenant, update=True, scenario_name=scenario_name, step_name=step_name)
-        _ensure_health_response_item(host_id, tenant, scenario_name=scenario_name, step_name=step_name)
-        _ensure_triggers(host_id, host_name, tenant, scenario_name=scenario_name, step_name=step_name)
-        return host_id
-
-    visible_name = tenant.tenant_name if tenant.tenant_name != tenant.domain else tenant.domain
-    try:
-        result = _zapi.host.create(
-            host=host_name,
-            name=visible_name,
-            groups=[{"groupid": group_id}],
-            tags=[
-                {"tag": "tenantId", "value": tenant.tenant_code},
-                {"tag": "licenseStatus", "value": tenant.license_status},
-                {"tag": "expiredDate", "value": tenant.expired_date},
-            ],
-        )
-    except ZabbixAPIException as exc:
-        if "same visible name" in str(exc) or "same technical name" in str(exc):
-            logger.warning("Skipping host create for %s: %s", host_name, exc)
-            return None
-        raise
-    host_id = result["hostids"][0]
-    logger.info("Created host %s (id=%s)", host_name, host_id)
+            logger.info("Re-enabled host %s", host_name)
+    else:
+        visible_name = tenant.tenant_name if tenant.tenant_name != tenant.domain else tenant.domain
+        try:
+            result = _zapi.host.create(
+                host=host_name,
+                name=visible_name,
+                groups=[{"groupid": group_id}],
+                tags=[
+                    {"tag": "tenantId", "value": tenant.tenant_code},
+                    {"tag": "licenseStatus", "value": tenant.license_status},
+                    {"tag": "expiredDate", "value": tenant.expired_date},
+                ],
+            )
+        except ZabbixAPIException as exc:
+            if "same visible name" in str(exc) or "same technical name" in str(exc):
+                logger.warning("Skipping host create for %s: %s", host_name, exc)
+                return None
+            raise
+        host_id = result["hostids"][0]
+        logger.info("Created host %s (id=%s)", host_name, host_id)
 
     _ensure_host_tags(host_id, tenant)
     _ensure_host_macros(host_id, tenant)
-    _ensure_web_scenario(host_id, tenant, update=False, scenario_name=scenario_name, step_name=step_name)
+    _ensure_web_scenario(host_id, tenant, scenario_name=scenario_name, step_name=step_name)
     _ensure_health_response_item(host_id, tenant, scenario_name=scenario_name, step_name=step_name)
     _ensure_triggers(host_id, host_name, tenant, scenario_name=scenario_name, step_name=step_name)
     return host_id
 
 
 def _ensure_host_tags(host_id: str, tenant: TenantInfo) -> None:
-    """Ensure host has the expected tenant-related tags, preserving any others."""
     desired = {
         "tenantId": str(tenant.tenant_code),
         "licenseStatus": tenant.license_status,
         "expiredDate": tenant.expired_date,
     }
-
-    hosts = _zapi.host.get(
-        hostids=host_id,
-        selectTags=["tag", "value"],
-        output=["hostid"],
-    )
+    hosts = _zapi.host.get(hostids=host_id, selectTags=["tag", "value"], output=["hostid"])
     current_tags = hosts[0].get("tags", []) if hosts else []
-
     tag_map: dict[str, str] = {t["tag"]: t["value"] for t in current_tags}
     tag_map.update(desired)
-
-    new_tags = [{"tag": k, "value": v} for k, v in tag_map.items()]
-    _zapi.host.update(hostid=host_id, tags=new_tags)
+    _zapi.host.update(hostid=host_id, tags=[{"tag": k, "value": v} for k, v in tag_map.items()])
 
 
 def _ensure_host_macros(host_id: str, tenant: TenantInfo) -> None:
-    """Host macro {$TENANT.DOMAIN} for alert message templates (e.g. SITE DOWN - <domain>)."""
     macro_name = "{$TENANT.DOMAIN}"
-    hosts = _zapi.host.get(
-        hostids=host_id,
-        selectMacros=["hostmacroid", "macro", "value"],
-        output=["hostid"],
-    )
+    hosts = _zapi.host.get(hostids=host_id, selectMacros=["hostmacroid", "macro", "value"], output=["hostid"])
     current = hosts[0].get("macros", []) if hosts else []
     found = next((m for m in current if m.get("macro") == macro_name), None)
     if found and found.get("value") == tenant.domain:
@@ -151,103 +117,76 @@ def _ensure_host_macros(host_id: str, tenant: TenantInfo) -> None:
         _zapi.usermacro.create(hostid=host_id, macro=macro_name, value=tenant.domain)
 
 
-def _ensure_web_scenario(
-    host_id: str,
-    tenant: TenantInfo,
-    update: bool,
-    *,
-    scenario_name: str,
-    step_name: str,
-) -> None:
-    """Create or update a Web Scenario (Zabbix HTTP check)."""
-    desired_posts, desired_headers = _web_scenario_step_extras(tenant.health_endpoint)
+def _ensure_web_scenario(host_id: str, tenant: TenantInfo, *, scenario_name: str, step_name: str) -> None:
+    desired_posts, desired_headers = _step_extras(tenant.health_endpoint)
+    scenarios = _zapi.httptest.get(
+        hostids=host_id,
+        selectSteps=["httpstepid", "url", "name", "posts", "headers"],
+        output=["httptestid", "name"],
+    )
 
-    if update:
-        scenarios = _zapi.httptest.get(
-            hostids=host_id,
-            selectSteps=["httpstepid", "url", "name", "posts", "headers"],
-            output=["httptestid", "name"],
-        )
-        if scenarios:
-            by_name = next((s for s in scenarios if s.get("name") == scenario_name), None)
-            chosen = by_name or scenarios[0]
-            step = chosen["steps"][0]
-            payload: dict[str, object] = {"httptestid": chosen["httptestid"]}
-            if chosen.get("name") != scenario_name:
-                payload["name"] = scenario_name
-            step_patch: dict[str, object] = {"httpstepid": step["httpstepid"]}
-            if step.get("url") != tenant.health_endpoint:
-                step_patch["url"] = tenant.health_endpoint
-            if step.get("name") != step_name:
-                step_patch["name"] = step_name
-            cur_posts = step.get("posts") if step.get("posts") is not None else ""
-            if cur_posts != desired_posts:
-                step_patch["posts"] = desired_posts
-            if not _headers_match(step.get("headers"), desired_headers):
-                step_patch["headers"] = desired_headers
-            if len(step_patch) > 1:
-                payload["steps"] = [step_patch]
-            if len(payload) > 1:
-                _zapi.httptest.update(**payload)
-                logger.info("Updated web scenario for %s", tenant.domain)
-            extra_ids = [
-                s["httptestid"] for s in scenarios if s["httptestid"] != chosen["httptestid"]
-            ]
-            if extra_ids:
-                _zapi.httptest.delete(*extra_ids)
-                logger.warning(
-                    "Removed %d duplicate web scenario(s) for hostid=%s",
-                    len(extra_ids),
-                    host_id,
-                )
-            return
+    if scenarios:
+        chosen = next((s for s in scenarios if s.get("name") == scenario_name), None) or scenarios[0]
+        step = chosen["steps"][0]
 
-    step_create: dict[str, object] = {
-        "name": step_name,
-        "url": tenant.health_endpoint,
-        "status_codes": config.ZABBIX_WEB_CHECK_STATUS_CODES,
-        "no": 1,
-        "timeout": config.ZABBIX_WEB_CHECK_TIMEOUT,
-        "follow_redirects": config.ZABBIX_WEB_CHECK_FOLLOW_REDIRECTS,
-        "posts": desired_posts,
-        "headers": desired_headers,
-    }
+        payload: dict[str, object] = {"httptestid": chosen["httptestid"]}
+        if chosen.get("name") != scenario_name:
+            payload["name"] = scenario_name
+
+        step_patch: dict[str, object] = {"httpstepid": step["httpstepid"]}
+        if step.get("url") != tenant.health_endpoint:
+            step_patch["url"] = tenant.health_endpoint
+        if step.get("name") != step_name:
+            step_patch["name"] = step_name
+        if (step.get("posts") or "") != desired_posts:
+            step_patch["posts"] = desired_posts
+        if not _headers_match(step.get("headers"), desired_headers):
+            step_patch["headers"] = desired_headers
+        if len(step_patch) > 1:
+            payload["steps"] = [step_patch]
+        if len(payload) > 1:
+            _zapi.httptest.update(**payload)
+            logger.info("Updated web scenario for %s", tenant.domain)
+
+        extra_ids = [s["httptestid"] for s in scenarios if s["httptestid"] != chosen["httptestid"]]
+        if extra_ids:
+            _zapi.httptest.delete(*extra_ids)
+            logger.warning("Removed %d duplicate web scenario(s) for hostid=%s", len(extra_ids), host_id)
+        return
+
     _zapi.httptest.create(
         name=scenario_name,
         hostid=host_id,
         delay=config.ZABBIX_WEB_CHECK_DELAY,
         retries=config.ZABBIX_WEB_CHECK_RETRIES,
         status=0,
-        steps=[step_create],
+        steps=[{
+            "name": step_name,
+            "url": tenant.health_endpoint,
+            "status_codes": config.ZABBIX_WEB_CHECK_STATUS_CODES,
+            "no": 1,
+            "timeout": config.ZABBIX_WEB_CHECK_TIMEOUT,
+            "follow_redirects": config.ZABBIX_WEB_CHECK_FOLLOW_REDIRECTS,
+            "posts": desired_posts,
+            "headers": desired_headers,
+        }],
     )
     logger.info("Created web scenario for %s -> %s", tenant.domain, tenant.health_endpoint)
 
 
 def _ensure_health_response_item(host_id: str, tenant: TenantInfo, scenario_name: str, step_name: str) -> None:
-    """Create or update a Dependent Item that mirrors the Web Scenario response body.
+    """Dependent Item that mirrors the web scenario response body (no extra HTTP request).
 
-    type=18 (Dependent Item) — no extra HTTP request is made. Zabbix feeds the
-    value from the master item (web.test.body[scenario,step]) which is already
-    collected by the Web Scenario on every check cycle.
-
-    The Telegram alert template references this item via:
+    Used in Telegram alert templates via:
         {?last(/{HOST.HOST}/healthcheck.response.raw)}
     """
     item_key = config.ZABBIX_HEALTH_RESPONSE_ITEM_KEY
     item_name = config.ZABBIX_HEALTH_RESPONSE_ITEM_NAME
 
-    # Resolve the master item id: web.test.body populated by the Web Scenario
     master_key = f"web.test.body[{scenario_name},{step_name}]"
-    master_items = _zapi.item.get(
-        hostids=host_id,
-        filter={"key_": master_key},
-        output=["itemid"],
-    )
+    master_items = _zapi.item.get(hostids=host_id, filter={"key_": master_key}, output=["itemid"])
     if not master_items:
-        logger.warning(
-            "Master item '%s' not found for host %s — skipping dependent item setup",
-            master_key, tenant.domain,
-        )
+        logger.warning("Master item '%s' not found for %s — skipping dependent item", master_key, tenant.domain)
         return
     master_itemid = master_items[0]["itemid"]
 
@@ -259,32 +198,32 @@ def _ensure_health_response_item(host_id: str, tenant: TenantInfo, scenario_name
 
     if existing:
         current = existing[0]
-        patch: dict[str, object] = {"itemid": current["itemid"]}
-        if current.get("name") != item_name:
-            patch["name"] = item_name
-        # If previously an HTTP agent item (type=19), recreate as Dependent (type=18)
+        # Recreate if previously created as HTTP agent item (type=19)
         if int(current.get("type", -1) or -1) != 18:
             _zapi.item.delete(current["itemid"])
-            logger.info("Deleted legacy HTTP agent item for %s, will recreate as Dependent", tenant.domain)
-            existing = []  # fall through to create
-        elif str(current.get("master_itemid", "")) != str(master_itemid):
-            patch["master_itemid"] = master_itemid
-        if len(patch) > 1 and existing:
-            _zapi.item.update(**patch)
-            logger.info("Updated dependent health response item for %s", tenant.domain)
+            logger.info("Deleted legacy HTTP agent item for %s, recreating as Dependent", tenant.domain)
+        else:
+            patch: dict[str, object] = {"itemid": current["itemid"]}
+            if current.get("name") != item_name:
+                patch["name"] = item_name
+            if str(current.get("master_itemid", "")) != str(master_itemid):
+                patch["master_itemid"] = master_itemid
+            if len(patch) > 1:
+                _zapi.item.update(**patch)
+                logger.info("Updated health response item for %s", tenant.domain)
+            return
 
-    if not existing:
-        _zapi.item.create(
-            name=item_name,
-            type=18,  # Dependent item
-            key_=item_key,
-            hostid=host_id,
-            value_type=4,  # text
-            master_itemid=master_itemid,
-            history="7d",
-            trends="0",
-        )
-        logger.info("Created dependent health response item for %s (master: %s)", tenant.domain, master_key)
+    _zapi.item.create(
+        name=item_name,
+        type=18,
+        key_=item_key,
+        hostid=host_id,
+        value_type=4,
+        master_itemid=master_itemid,
+        history="7d",
+        trends="0",
+    )
+    logger.info("Created health response item for %s (master: %s)", tenant.domain, master_key)
 
 
 def _ensure_triggers(
@@ -295,56 +234,33 @@ def _ensure_triggers(
     scenario_name: str,
     step_name: str,
 ) -> None:
-    """Create or update DOWN + slow-response triggers for a tenant host.
-
-    opdata uses {ITEM.VALUE} (first item in expression = web.test.rspcode).
-    This renders correctly as the HTTP status code in {EVENT.OPDATA}.
-
-    Response body from healthcheck.php is exposed via the healthcheck.response.raw
-    HTTP agent item. Reference it in the Zabbix Action / Media Type message template:
-        Response: {?last(/{HOST.HOST}/healthcheck.response.raw)}
-    Expression macros ARE resolved in Action/Media Type templates.
-
-    Inherited triggers (flags=4, from templates) are skipped during cleanup
-    because trigger.delete on an inherited trigger raises a Zabbix API error.
-    """
     down_desc = f"[{tenant.tenant_name}] SITE DOWN - {tenant.domain}"
     slow_desc = f"[{tenant.tenant_name}] Slow response - {tenant.domain}"
 
-    codes = [c.strip() for c in config.ZABBIX_TRIGGER_DOWN_RSP_CODES.split(",") if c.strip()]
-    if not codes:
-        codes = ["500", "502", "503", "504"]
+    codes = [c.strip() for c in config.ZABBIX_TRIGGER_DOWN_RSP_CODES.split(",") if c.strip()] or ["500", "502", "503", "504"]
     down_expr = " or ".join(
-        f"last(/{host_name}/web.test.rspcode[{scenario_name},{step_name}])={c}"
-        for c in codes
+        f"last(/{host_name}/web.test.rspcode[{scenario_name},{step_name}])={c}" for c in codes
     )
-    # {ITEM.VALUE} maps to the first item in down_expr = web.test.rspcode.
-    # Renders as the HTTP status code when {EVENT.OPDATA} is used in the template.
     down_opdata = "Status code: {ITEM.VALUE}"
-
     slow_expr = (
-        f"last(/{host_name}/web.test.time[{scenario_name},{step_name},resp])>"
-        f"{config.ZABBIX_WEB_SLOW_SECONDS}"
+        f"last(/{host_name}/web.test.time[{scenario_name},{step_name},resp])>{config.ZABBIX_WEB_SLOW_SECONDS}"
     )
 
-    # Managed trigger descriptions — anything else on this host gets removed
     managed_descs = {down_desc, slow_desc}
 
-    # --- DOWN trigger ---
+    # DOWN trigger
     existing_down = _zapi.trigger.get(
-        hostids=host_id,
-        filter={"description": down_desc},
-        output=["triggerid", "expression", "opdata"],
+        hostids=host_id, filter={"description": down_desc}, output=["triggerid", "expression", "opdata"],
     )
     if existing_down:
         trig = existing_down[0]
-        payload: dict[str, object] = {"triggerid": trig["triggerid"]}
+        patch: dict[str, object] = {"triggerid": trig["triggerid"]}
         if trig["expression"] != down_expr:
-            payload["expression"] = down_expr
+            patch["expression"] = down_expr
         if trig.get("opdata", "") != down_opdata:
-            payload["opdata"] = down_opdata
-        if len(payload) > 1:
-            _zapi.trigger.update(**payload)
+            patch["opdata"] = down_opdata
+        if len(patch) > 1:
+            _zapi.trigger.update(**patch)
     else:
         _zapi.trigger.create(
             description=down_desc,
@@ -357,11 +273,9 @@ def _ensure_triggers(
             ],
         )
 
-    # --- Slow response trigger ---
+    # Slow response trigger
     existing_slow = _zapi.trigger.get(
-        hostids=host_id,
-        filter={"description": slow_desc},
-        output=["triggerid", "expression"],
+        hostids=host_id, filter={"description": slow_desc}, output=["triggerid", "expression"],
     )
     if existing_slow:
         trig = existing_slow[0]
@@ -380,33 +294,20 @@ def _ensure_triggers(
 
     logger.info("Ensured triggers for %s", tenant.domain)
 
-    # Cleanup: remove triggers not managed by this code, including Zabbix
-    # built-in web scenario triggers and legacy triggers from old code versions.
-    # inherited=False excludes template-inherited triggers which cannot be deleted.
-    all_triggers = _zapi.trigger.get(
-        hostids=host_id,
-        output=["triggerid", "description"],
-        inherited=False,
-    )
+    # Remove unmanaged triggers (built-in web scenario triggers, legacy triggers, etc.)
+    # inherited=False skips template-inherited triggers which cannot be deleted via API.
+    all_triggers = _zapi.trigger.get(hostids=host_id, output=["triggerid", "description"], inherited=False)
     for t in all_triggers:
         if t.get("description") not in managed_descs:
             try:
                 _zapi.trigger.delete(t["triggerid"])
                 logger.info("Removed unmanaged trigger '%s' (id=%s)", t["description"], t["triggerid"])
             except ZabbixAPIException as exc:
-                logger.warning(
-                    "Could not remove trigger '%s' (id=%s): %s",
-                    t["description"], t["triggerid"], exc,
-                )
+                logger.warning("Could not remove trigger '%s' (id=%s): %s", t["description"], t["triggerid"], exc)
 
 
 def migrate_legacy_hosts(group_id: str) -> None:
-    """One-time migration: rename hosts still using the old 'tenant-<uuid>' scheme to domain.
-
-    Looks up the {$TENANT.DOMAIN} macro on each old-style host and renames the
-    technical host name (host field) to the domain value. Safe to call every
-    cycle — hosts already using a domain name are ignored.
-    """
+    """Rename hosts still using the old 'tenant-<uuid>' scheme to their domain name."""
     hosts = _zapi.host.get(
         groupids=group_id,
         output=["hostid", "host"],
@@ -416,33 +317,23 @@ def migrate_legacy_hosts(group_id: str) -> None:
         name: str = host["host"]
         if not name.startswith("tenant-"):
             continue
-        macros: list[dict] = host.get("macros", [])
         domain = next(
-            (m["value"] for m in macros if m.get("macro") == "{$TENANT.DOMAIN}"),
+            (m["value"] for m in host.get("macros", []) if m.get("macro") == "{$TENANT.DOMAIN}"),
             None,
         )
         if not domain:
-            logger.info(
-                "Legacy host %s has no {$TENANT.DOMAIN} macro; "
-                "will be disabled by disable_removed_tenants after domain-named host is synced",
-                name,
-            )
+            logger.info("Legacy host %s has no {$TENANT.DOMAIN} macro — skipping migration", name)
             continue
         conflict = _zapi.host.get(filter={"host": domain}, output=["hostid"])
         if conflict:
-            logger.warning(
-                "Cannot rename %s -> %s: target host already exists (hostid=%s)",
-                name,
-                domain,
-                conflict[0]["hostid"],
-            )
+            logger.warning("Cannot rename %s -> %s: target host already exists (id=%s)", name, domain, conflict[0]["hostid"])
             continue
         _zapi.host.update(hostid=host["hostid"], host=domain)
         logger.info("Migrated host %s -> %s", name, domain)
 
 
 def disable_removed_tenants(active_domains: set[str], group_id: str) -> None:
-    """Disable hosts whose domain is no longer in the active list."""
+    """Disable hosts whose domain is no longer in the active tenant list."""
     hosts = _zapi.host.get(groupids=group_id, output=["hostid", "host", "status"])
     normalized_active = {str(d) for d in active_domains}
     for host in hosts:
