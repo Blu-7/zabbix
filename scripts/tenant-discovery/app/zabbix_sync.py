@@ -318,9 +318,13 @@ def _ensure_triggers(
 ) -> None:
     """Create or update DOWN + slow-response triggers for a tenant host.
 
-    opdata references both the status code (web.test.rspcode) and the raw
-    healthcheck response body (healthcheck.response.raw) via expression macros
-    so Telegram alerts show full context.
+    opdata uses {ITEM.VALUE} (first item in expression = web.test.rspcode).
+    This renders correctly as the HTTP status code in {EVENT.OPDATA}.
+
+    Response body from healthcheck.php is exposed via the healthcheck.response.raw
+    HTTP agent item. Reference it in the Zabbix Action / Media Type message template:
+        Response: {?last(/{HOST.HOST}/healthcheck.response.raw)}
+    Expression macros ARE resolved in Action/Media Type templates.
 
     Inherited triggers (flags=4, from templates) are skipped during cleanup
     because trigger.delete on an inherited trigger raises a Zabbix API error.
@@ -335,13 +339,9 @@ def _ensure_triggers(
         f"last(/{host_name}/web.test.rspcode[{scenario_name},{step_name}])={c}"
         for c in codes
     )
-    # Use expression macros for opdata — both items must have live data for
-    # Zabbix to resolve them. healthcheck.response.raw is kept in sync by
-    # _ensure_health_response_item() so last() always has a fresh value.
-    down_opdata = (
-        f"Status code: {{?last(/{host_name}/web.test.rspcode[{scenario_name},{step_name}])}}\n"
-        f"Response: {{?last(/{host_name}/{config.ZABBIX_HEALTH_RESPONSE_ITEM_KEY})}}"
-    )
+    # {ITEM.VALUE} maps to the first item in down_expr = web.test.rspcode.
+    # Renders as the HTTP status code when {EVENT.OPDATA} is used in the template.
+    down_opdata = "Status code: {ITEM.VALUE}"
 
     slow_expr = (
         f"last(/{host_name}/web.test.time[{scenario_name},{step_name},resp])>"
@@ -401,13 +401,13 @@ def _ensure_triggers(
 
     logger.info("Ensured triggers for %s", tenant.domain)
 
-    # Cleanup: remove triggers not managed by this code.
-    # flags=4 means the trigger is inherited from a template — these cannot be
-    # deleted directly (Zabbix API raises an error); skip them.
+    # Cleanup: remove triggers not managed by this code, including Zabbix
+    # built-in web scenario triggers and legacy triggers from old code versions.
+    # inherited=False excludes template-inherited triggers which cannot be deleted.
     all_triggers = _zapi.trigger.get(
         hostids=host_id,
-        output=["triggerid", "description", "flags"],
-        inherited=False,  # only host-level (non-template) triggers
+        output=["triggerid", "description"],
+        inherited=False,
     )
     for t in all_triggers:
         if t.get("description") not in managed_descs:
