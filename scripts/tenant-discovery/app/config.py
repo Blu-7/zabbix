@@ -41,6 +41,13 @@ ZABBIX_TRIGGER_DOWN_RSP_CODES = os.getenv("ZABBIX_TRIGGER_DOWN_RSP_CODES", "500,
 ZABBIX_HEALTH_RESPONSE_ITEM_KEY = os.getenv("ZABBIX_HEALTH_RESPONSE_ITEM_KEY", "healthcheck.response.raw")
 ZABBIX_HEALTH_RESPONSE_ITEM_NAME = os.getenv("ZABBIX_HEALTH_RESPONSE_ITEM_NAME", "Healthcheck response body")
 ZABBIX_HEALTH_RESPONSE_ITEM_DELAY = os.getenv("ZABBIX_HEALTH_RESPONSE_ITEM_DELAY", ZABBIX_WEB_CHECK_DELAY)
+# Single upstream HTTP call per tenant: master item fetches URL once, dependent
+# items derive statuscode/body via preprocessing. This kills the double-hit
+# caused by running a Web Scenario and an HTTP agent item in parallel.
+ZABBIX_HEALTH_MASTER_ITEM_KEY = os.getenv("ZABBIX_HEALTH_MASTER_ITEM_KEY", "healthcheck.raw")
+ZABBIX_HEALTH_MASTER_ITEM_NAME = os.getenv("ZABBIX_HEALTH_MASTER_ITEM_NAME", "Healthcheck raw (master)")
+ZABBIX_HEALTH_STATUSCODE_ITEM_KEY = os.getenv("ZABBIX_HEALTH_STATUSCODE_ITEM_KEY", "healthcheck.statuscode")
+ZABBIX_HEALTH_STATUSCODE_ITEM_NAME = os.getenv("ZABBIX_HEALTH_STATUSCODE_ITEM_NAME", "Healthcheck HTTP status code")
 
 DISCOVERY_INTERVAL = int(os.getenv("DISCOVERY_INTERVAL", "300"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
