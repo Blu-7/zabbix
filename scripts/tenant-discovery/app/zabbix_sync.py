@@ -255,13 +255,17 @@ def _ensure_triggers(
     codes = [c.strip() for c in config.ZABBIX_TRIGGER_DOWN_RSP_CODES.split(",") if c.strip()]
     if not codes:
         codes = ["500", "502", "503", "504"]
-    down_expr = " or ".join(
+    rspcode_expr_parts = [
         f"last(/{host_name}/web.test.rspcode[{scenario_name},{step_name}])={c}"
         for c in codes
-    )
+    ]
+    # Reference healthcheck item so {ITEM.VALUE2} works in opdata.
+    # length() is always >=0, so <0 is never true — this clause never fires.
+    health_expr = f"length(last(/{host_name}/{config.ZABBIX_HEALTH_RESPONSE_ITEM_KEY}))<0"
+    down_expr = " or ".join(rspcode_expr_parts) + " or " + health_expr
     down_opdata = (
-        f"Status code: {{?last(/{host_name}/web.test.rspcode[{scenario_name},{step_name}])}}\n"
-        f"Response: {{?last(/{host_name}/{config.ZABBIX_HEALTH_RESPONSE_ITEM_KEY})}}"
+        f"Status code: {{ITEM.VALUE1}}\n"
+        f"Response: {{ITEM.VALUE2}}"
     )
     slow_expr = (
         f"last(/{host_name}/web.test.time[{scenario_name},{step_name},resp])>"
