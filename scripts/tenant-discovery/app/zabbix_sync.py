@@ -29,22 +29,6 @@ def _web_scenario_step_extras(health_endpoint: str) -> tuple[str, list[dict[str,
     return "", []
 
 
-def _http_item_monitor_fields(health_endpoint: str) -> dict[str, object]:
-    if _health_endpoint_uses_authenticated_healthcheck(health_endpoint):
-        return {
-            "request_method": 1,
-            "post_type": 2,
-            "posts": _monitor_json_body(),
-            "headers": [],
-        }
-    return {
-        "request_method": 0,
-        "post_type": 0,
-        "posts": "",
-        "headers": [],
-    }
-
-
 def _headers_match(a: object, b: object) -> bool:
     def _norm(obj: object) -> list[tuple[str, str]]:
         if not isinstance(obj, list) or not obj:
@@ -95,7 +79,7 @@ def sync_tenant(tenant: TenantInfo, group_id: str) -> str | None:
         _ensure_host_tags(host_id, tenant)
         _ensure_host_macros(host_id, tenant)
         _ensure_web_scenario(host_id, tenant, update=True, scenario_name=scenario_name, step_name=step_name)
-        _ensure_health_response_item(host_id, tenant)
+        _ensure_health_response_item(host_id, tenant, scenario_name=scenario_name, step_name=step_name)
         _ensure_triggers(host_id, host_name, tenant, scenario_name=scenario_name, step_name=step_name)
         return host_id
 
@@ -122,7 +106,7 @@ def sync_tenant(tenant: TenantInfo, group_id: str) -> str | None:
     _ensure_host_tags(host_id, tenant)
     _ensure_host_macros(host_id, tenant)
     _ensure_web_scenario(host_id, tenant, update=False, scenario_name=scenario_name, step_name=step_name)
-    _ensure_health_response_item(host_id, tenant)
+    _ensure_health_response_item(host_id, tenant, scenario_name=scenario_name, step_name=step_name)
     _ensure_triggers(host_id, host_name, tenant, scenario_name=scenario_name, step_name=step_name)
     return host_id
 
@@ -239,73 +223,68 @@ def _ensure_web_scenario(
     logger.info("Created web scenario for %s -> %s", tenant.domain, tenant.health_endpoint)
 
 
-def _ensure_health_response_item(host_id: str, tenant: TenantInfo) -> None:
-    """Create or update an HTTP agent item that stores the raw healthcheck response body.
+def _ensure_health_response_item(host_id: str, tenant: TenantInfo, scenario_name: str, step_name: str) -> None:
+    """Create or update a Dependent Item that mirrors the Web Scenario response body.
 
-    retrieve_mode=2 captures both response body and headers so alert opdata
-    can reference the body via expression macro {?last(...healthcheck.response.raw)}.
-    The item delay is kept in sync with the web scenario so last() always
-    reflects a fresh value at alert time.
+    type=18 (Dependent Item) — no extra HTTP request is made. Zabbix feeds the
+    value from the master item (web.test.body[scenario,step]) which is already
+    collected by the Web Scenario on every check cycle.
+
+    The Telegram alert template references this item via:
+        {?last(/{HOST.HOST}/healthcheck.response.raw)}
     """
     item_key = config.ZABBIX_HEALTH_RESPONSE_ITEM_KEY
     item_name = config.ZABBIX_HEALTH_RESPONSE_ITEM_NAME
 
-    monitor = _http_item_monitor_fields(tenant.health_endpoint)
+    # Resolve the master item id: web.test.body populated by the Web Scenario
+    master_key = f"web.test.body[{scenario_name},{step_name}]"
+    master_items = _zapi.item.get(
+        hostids=host_id,
+        filter={"key_": master_key},
+        output=["itemid"],
+    )
+    if not master_items:
+        logger.warning(
+            "Master item '%s' not found for host %s — skipping dependent item setup",
+            master_key, tenant.domain,
+        )
+        return
+    master_itemid = master_items[0]["itemid"]
 
     existing = _zapi.item.get(
         hostids=host_id,
         filter={"key_": item_key},
-        output=[
-            "itemid", "name", "url", "delay", "timeout",
-            "request_method", "post_type", "posts", "headers", "retrieve_mode",
-        ],
+        output=["itemid", "name", "master_itemid", "type"],
     )
-
-    payload: dict[str, object] = {
-        "name": item_name,
-        "type": 19,  # HTTP agent
-        "key_": item_key,
-        "hostid": host_id,
-        "value_type": 4,  # text
-        "url": tenant.health_endpoint,
-        "timeout": config.ZABBIX_WEB_CHECK_TIMEOUT,
-        "delay": config.ZABBIX_HEALTH_RESPONSE_ITEM_DELAY,
-        "history": "7d",
-        "trends": "0",
-        "follow_redirects": config.ZABBIX_WEB_CHECK_FOLLOW_REDIRECTS,
-        "retrieve_mode": 2,  # body + headers
-        "allow_traps": 0,
-        **monitor,
-    }
 
     if existing:
         current = existing[0]
         patch: dict[str, object] = {"itemid": current["itemid"]}
         if current.get("name") != item_name:
             patch["name"] = item_name
-        if current.get("url") != tenant.health_endpoint:
-            patch["url"] = tenant.health_endpoint
-        if current.get("timeout") != config.ZABBIX_WEB_CHECK_TIMEOUT:
-            patch["timeout"] = config.ZABBIX_WEB_CHECK_TIMEOUT
-        if current.get("delay") != config.ZABBIX_HEALTH_RESPONSE_ITEM_DELAY:
-            patch["delay"] = config.ZABBIX_HEALTH_RESPONSE_ITEM_DELAY
-        if int(current.get("retrieve_mode", -1) or -1) != 2:
-            patch["retrieve_mode"] = 2
-        if int(current.get("request_method", -1) or -1) != int(monitor["request_method"]):
-            patch["request_method"] = monitor["request_method"]
-        if int(current.get("post_type", -1) or -1) != int(monitor["post_type"]):
-            patch["post_type"] = monitor["post_type"]
-        cur_posts = current.get("posts") if current.get("posts") is not None else ""
-        if cur_posts != str(monitor["posts"]):
-            patch["posts"] = monitor["posts"]
-        if not _headers_match(current.get("headers"), monitor["headers"]):
-            patch["headers"] = monitor["headers"]
-        if len(patch) > 1:
+        # If previously an HTTP agent item (type=19), recreate as Dependent (type=18)
+        if int(current.get("type", -1) or -1) != 18:
+            _zapi.item.delete(current["itemid"])
+            logger.info("Deleted legacy HTTP agent item for %s, will recreate as Dependent", tenant.domain)
+            existing = []  # fall through to create
+        elif str(current.get("master_itemid", "")) != str(master_itemid):
+            patch["master_itemid"] = master_itemid
+        if len(patch) > 1 and existing:
             _zapi.item.update(**patch)
-            logger.info("Updated health response item for %s", tenant.domain)
-    else:
-        _zapi.item.create(**payload)
-        logger.info("Created health response item for %s -> %s", tenant.domain, tenant.health_endpoint)
+            logger.info("Updated dependent health response item for %s", tenant.domain)
+
+    if not existing:
+        _zapi.item.create(
+            name=item_name,
+            type=18,  # Dependent item
+            key_=item_key,
+            hostid=host_id,
+            value_type=4,  # text
+            master_itemid=master_itemid,
+            history="7d",
+            trends="0",
+        )
+        logger.info("Created dependent health response item for %s (master: %s)", tenant.domain, master_key)
 
 
 def _ensure_triggers(
