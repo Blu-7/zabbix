@@ -29,22 +29,6 @@ def _web_scenario_step_extras(health_endpoint: str) -> tuple[str, list[dict[str,
     return "", []
 
 
-def _http_item_monitor_fields(health_endpoint: str) -> dict[str, object]:
-    if _health_endpoint_uses_authenticated_healthcheck(health_endpoint):
-        return {
-            "request_method": 1,
-            "post_type": 2,
-            "posts": _monitor_json_body(),
-            "headers": [],
-        }
-    return {
-        "request_method": 0,
-        "post_type": 0,
-        "posts": "",
-        "headers": [],
-    }
-
-
 def _headers_match(a: object, b: object) -> bool:
     def _norm(obj: object) -> list[tuple[str, str]]:
         if not isinstance(obj, list) or not obj:
@@ -95,7 +79,7 @@ def sync_tenant(tenant: TenantInfo, group_id: str) -> str | None:
         _ensure_host_tags(host_id, tenant)
         _ensure_host_macros(host_id, tenant)
         _ensure_web_scenario(host_id, tenant, update=True, scenario_name=scenario_name, step_name=step_name)
-        _ensure_health_response_item(host_id, tenant)
+        _cleanup_legacy_health_response_item(host_id, tenant)
         _ensure_triggers(host_id, host_name, tenant, scenario_name=scenario_name, step_name=step_name)
         return host_id
 
@@ -122,7 +106,6 @@ def sync_tenant(tenant: TenantInfo, group_id: str) -> str | None:
     _ensure_host_tags(host_id, tenant)
     _ensure_host_macros(host_id, tenant)
     _ensure_web_scenario(host_id, tenant, update=False, scenario_name=scenario_name, step_name=step_name)
-    _ensure_health_response_item(host_id, tenant)
     _ensure_triggers(host_id, host_name, tenant, scenario_name=scenario_name, step_name=step_name)
     return host_id
 
@@ -142,7 +125,6 @@ def _ensure_host_tags(host_id: str, tenant: TenantInfo) -> None:
     )
     current_tags = hosts[0].get("tags", []) if hosts else []
 
-    # Build map tag -> value so we can merge
     tag_map: dict[str, str] = {t["tag"]: t["value"] for t in current_tags}
     tag_map.update(desired)
 
@@ -240,6 +222,29 @@ def _ensure_web_scenario(
     logger.info("Created web scenario for %s -> %s", tenant.domain, tenant.health_endpoint)
 
 
+def _cleanup_legacy_health_response_item(host_id: str, tenant: TenantInfo) -> None:
+    """Remove the legacy HTTP agent item (healthcheck.response.raw) if it still exists.
+
+    This item was previously used to capture response body but is redundant
+    since the web scenario already performs the same HTTP request. Removing it
+    eliminates the duplicate request per check cycle.
+    """
+    item_key = config.ZABBIX_HEALTH_RESPONSE_ITEM_KEY
+    existing = _zapi.item.get(
+        hostids=host_id,
+        filter={"key_": item_key},
+        output=["itemid"],
+    )
+    if existing:
+        item_ids = [item["itemid"] for item in existing]
+        _zapi.item.delete(*item_ids)
+        logger.info(
+            "Removed legacy health response item(s) %s for %s",
+            item_ids,
+            tenant.domain,
+        )
+
+
 def _ensure_triggers(
     host_id: str,
     host_name: str,
@@ -248,7 +253,12 @@ def _ensure_triggers(
     scenario_name: str,
     step_name: str,
 ) -> None:
-    """Create or update DOWN + slow-response triggers for a tenant host."""
+    """Create or update DOWN + slow-response triggers for a tenant host.
+
+    opdata uses {ITEM.VALUE1} (built-in trigger macro) for the status code so
+    Zabbix resolves it correctly at alert time — expression macros {?last(...)}
+    are not reliably resolved in all Zabbix versions and notification channels.
+    """
     down_desc = f"[{tenant.tenant_name}] SITE DOWN - {tenant.domain}"
     slow_desc = f"[{tenant.tenant_name}] Slow response - {tenant.domain}"
 
@@ -259,16 +269,21 @@ def _ensure_triggers(
         f"last(/{host_name}/web.test.rspcode[{scenario_name},{step_name}])={c}"
         for c in codes
     )
-    down_opdata = (
-        f"Status code: {{ITEM.VALUE1}}\n"
-        f"Response time: {{?last(/{host_name}/web.test.time[{scenario_name},{step_name},resp])}}s"
-    )
+    # Use {ITEM.VALUE1} — the built-in trigger macro that Zabbix always resolves
+    # correctly in opdata, regardless of version or notification channel.
+    # Expression macro {?last(...)} is NOT used here as it fails to render in
+    # many Zabbix setups (including Telegram alerts).
+    down_opdata = "Status code: {ITEM.VALUE1}"
+
     slow_expr = (
         f"last(/{host_name}/web.test.time[{scenario_name},{step_name},resp])>"
         f"{config.ZABBIX_WEB_SLOW_SECONDS}"
     )
 
-    # Create downtime trigger if it doesn't exist
+    # Managed trigger descriptions — anything else on this host gets removed
+    managed_descs = {down_desc, slow_desc}
+
+    # --- DOWN trigger ---
     existing_down = _zapi.trigger.get(
         hostids=host_id,
         filter={"description": down_desc},
@@ -295,7 +310,7 @@ def _ensure_triggers(
             ],
         )
 
-    # Create slow response trigger if it doesn't exist
+    # --- Slow response trigger ---
     existing_slow = _zapi.trigger.get(
         hostids=host_id,
         filter={"description": slow_desc},
@@ -317,86 +332,19 @@ def _ensure_triggers(
         )
 
     logger.info("Ensured triggers for %s", tenant.domain)
-    # Cleanup: remove Zabbix built-in web scenario error triggers
+
+    # Cleanup: remove ALL triggers not managed by this code, including:
+    # - Zabbix built-in web scenario error triggers (e.g. "Web scenario ... failed")
+    # - Legacy triggers from previous code versions
+    # - The erroneous "last error message" trigger checking for status code 300
     all_triggers = _zapi.trigger.get(
         hostids=host_id,
-        output=["triggerid", "description", "expression"],
+        output=["triggerid", "description"],
     )
     for t in all_triggers:
-        desc = t.get("description", "")
-        expr = t.get("expression", "")
-        # Remove triggers not managed by us (not match down_desc or slow_desc)
-        if desc != down_desc and desc != slow_desc:
+        if t.get("description") not in managed_descs:
             _zapi.trigger.delete(t["triggerid"])
-            logger.info("Removed legacy trigger '%s' (id=%s)", desc, t["triggerid"])
-
-
-def _ensure_health_response_item(host_id: str, tenant: TenantInfo) -> None:
-    """Create or update an HTTP agent item that stores the raw healthcheck response body.
-
-    retrieve_mode=2 captures both response body and headers so alert messages
-    can include full context. The item delay is kept in sync with the web scenario
-    so last() in trigger opdata always reflects a fresh value.
-    """
-    item_key = config.ZABBIX_HEALTH_RESPONSE_ITEM_KEY
-    item_name = config.ZABBIX_HEALTH_RESPONSE_ITEM_NAME
-
-    monitor = _http_item_monitor_fields(tenant.health_endpoint)
-
-    existing = _zapi.item.get(
-        hostids=host_id,
-        filter={"key_": item_key},
-        output=[
-            "itemid", "name", "url", "delay", "timeout",
-            "request_method", "post_type", "posts", "headers", "retrieve_mode",
-        ],
-    )
-
-    payload: dict[str, object] = {
-        "name": item_name,
-        "type": 19,  # HTTP agent
-        "key_": item_key,
-        "hostid": host_id,
-        "value_type": 4,  # text
-        "url": tenant.health_endpoint,
-        "timeout": config.ZABBIX_WEB_CHECK_TIMEOUT,
-        "delay": config.ZABBIX_HEALTH_RESPONSE_ITEM_DELAY,
-        "history": "7d",
-        "trends": "0",
-        "follow_redirects": config.ZABBIX_WEB_CHECK_FOLLOW_REDIRECTS,
-        "retrieve_mode": 2,  # body + headers
-        "allow_traps": 0,
-        **monitor,
-    }
-
-    if existing:
-        current = existing[0]
-        patch: dict[str, object] = {"itemid": current["itemid"]}
-        if current.get("name") != item_name:
-            patch["name"] = item_name
-        if current.get("url") != tenant.health_endpoint:
-            patch["url"] = tenant.health_endpoint
-        if current.get("timeout") != config.ZABBIX_WEB_CHECK_TIMEOUT:
-            patch["timeout"] = config.ZABBIX_WEB_CHECK_TIMEOUT
-        if current.get("delay") != config.ZABBIX_HEALTH_RESPONSE_ITEM_DELAY:
-            patch["delay"] = config.ZABBIX_HEALTH_RESPONSE_ITEM_DELAY
-        if int(current.get("retrieve_mode", -1) or -1) != 2:
-            patch["retrieve_mode"] = 2
-        if int(current.get("request_method", -1) or -1) != int(monitor["request_method"]):
-            patch["request_method"] = monitor["request_method"]
-        if int(current.get("post_type", -1) or -1) != int(monitor["post_type"]):
-            patch["post_type"] = monitor["post_type"]
-        cur_posts = current.get("posts") if current.get("posts") is not None else ""
-        if cur_posts != str(monitor["posts"]):
-            patch["posts"] = monitor["posts"]
-        if not _headers_match(current.get("headers"), monitor["headers"]):
-            patch["headers"] = monitor["headers"]
-        if len(patch) > 1:
-            _zapi.item.update(**patch)
-            logger.info("Updated health response item for %s", tenant.domain)
-    else:
-        _zapi.item.create(**payload)
-        logger.info("Created health response item for %s -> %s", tenant.domain, tenant.health_endpoint)
+            logger.info("Removed unmanaged trigger '%s' (id=%s)", t["description"], t["triggerid"])
 
 
 def migrate_legacy_hosts(group_id: str) -> None:
@@ -413,7 +361,6 @@ def migrate_legacy_hosts(group_id: str) -> None:
     )
     for host in hosts:
         name: str = host["host"]
-        # Old pattern: "tenant-" followed by a UUID (36 chars) or any non-domain string
         if not name.startswith("tenant-"):
             continue
         macros: list[dict] = host.get("macros", [])
@@ -428,7 +375,6 @@ def migrate_legacy_hosts(group_id: str) -> None:
                 name,
             )
             continue
-        # Check no host with the target domain name already exists
         conflict = _zapi.host.get(filter={"host": domain}, output=["hostid"])
         if conflict:
             logger.warning(
